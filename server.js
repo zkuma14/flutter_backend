@@ -35,13 +35,21 @@ app.post('/auth/login', async (req, res) => {
     let user = userResult.rows[0];
 
     if (!user) {
-      // 2. 새 사용자 생성
-      userResult = await db.query(
-        'INSERT INTO users (display_name, preferred_sport) VALUES ($1, $2) RETURNING *',
-        [displayName, '']
-      );
-      user = userResult.rows[0];
-    }
+        // 2. 새 사용자 생성 (⭐️ 'email', 'password_hash'에 가짜 데이터 추가)
+        
+        // ⭐️ 2-1. 중복되지 않는 가짜 이메일 생성 (예: 1678886400000@dummy.com)
+        const dummyEmail = `${Date.now()}@dummy.com`;
+        // ⭐️ 2-2. 가짜 패스워드
+        const dummyPassword = 'dummy_password_hash'; 
+
+        userResult = await db.query(
+          `INSERT INTO users (display_name, preferred_sport, email, password_hash) 
+           VALUES ($1, $2, $3, $4) 
+           RETURNING *`,
+          [displayName, '', dummyEmail, dummyPassword] // ⭐️ 4개 값 전달
+        );
+        user = userResult.rows[0];
+      }
 
     // 3. JWT 토큰 생성 (사용자 ID와 이름을 담음)
     const token = jwt.sign(
