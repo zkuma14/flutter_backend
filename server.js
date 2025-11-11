@@ -1,4 +1,4 @@
-// server.js (⭐️ Full Version)
+// server.js (⭐️ 최종 완성본)
 const express = require('express');
 const http = require('http'); // ⭐️ WebSocket을 위해 http 모듈 사용
 const WebSocket = require('ws'); // ⭐️ WebSocket 모듈
@@ -9,7 +9,7 @@ require('dotenv').config(); // ⭐️ .env 파일 로드
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_SECRET = process.env.JWT_SECRET; // ⭐️ 대문자 JWT_SECRET
 
 // 1. 미들웨어 설정
 app.use(cors());
@@ -54,7 +54,7 @@ app.post('/auth/login', async (req, res) => {
     // 3. JWT 토큰 생성 (사용자 ID와 이름을 담음)
     const token = jwt.sign(
       { userId: user.id, name: user.display_name }, 
-      JWT_SECRET, 
+      JWT_SECRET, // ⭐️ 대문자 JWT_SECRET
       { expiresIn: '30d' } // 30일 유효
     );
 
@@ -70,14 +70,13 @@ app.post('/auth/login', async (req, res) => {
 // ---------------------------------
 // 🔐 3. 인증 미들웨어 (⭐️ 핵심 보안)
 // ---------------------------------
-// API를 호출할 때 헤더(Authorization)에 실린 토큰을 검증합니다.
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
 
   if (token == null) return res.sendStatus(401); // 토큰 없음
 
-  jwt.verify(token, JWT_SECRET, (err, user) => {
+  jwt.verify(token, JWT_SECRET, (err, user) => { // ⭐️ 대문자 JWT_SECRET
     if (err) return res.sendStatus(403); // 유효하지 않은 토큰
     req.user = user; // ⭐️ 요청 객체에 유저 정보를 심음
     next(); // 다음 단계로 이동
@@ -181,6 +180,52 @@ app.get('/rooms', authenticateToken, async (req, res) => {
   }
 });
 
+// ⭐️⭐️⭐️ 누락되었던 "채팅방 생성" API ⭐️⭐️⭐️
+// POST /rooms (새 채팅방 생성)
+app.post('/rooms', authenticateToken, async (req, res) => {
+  const { userIds, roomName } = req.body; // userIds는 상대방 ID 목록
+  const creatorId = req.user.userId; // 방을 만든 사람 ID (내 ID)
+
+  // 1. 모든 참가자 목록 (나 + 상대방)
+  const allParticipantIds = [creatorId, ...userIds];
+
+  try {
+    // ⭐️ 트랜잭션 시작
+    await db.query('BEGIN');
+
+    // 2. chat_rooms 테이블에 방 생성
+    const roomResult = await db.query(
+      'INSERT INTO chat_rooms (room_name, last_message, last_message_timestamp) VALUES ($1, $2, NOW()) RETURNING id',
+      [roomName, '채팅방이 생성되었습니다.']
+    );
+    const newChatRoomId = roomResult.rows[0].id;
+
+    // 3. participants 테이블에 모든 참가자 추가
+    const participantPromises = allParticipantIds.map(userId => {
+      return db.query(
+        'INSERT INTO participants (chat_room_id, user_id, unread_count, is_hidden, left_at) VALUES ($1, $2, $3, $4, $5)',
+        [newChatRoomId, userId, 0, false, null] // ⭐️ 0, false, null로 초기화
+      );
+    });
+    
+    // 4. 모든 참가자 추가 쿼리가 성공할 때까지 대기
+    await Promise.all(participantPromises);
+
+    // 5. ⭐️ 모든 작업 성공 시 DB에 최종 반영
+    await db.query('COMMIT');
+
+    // 6. Flutter 앱에 새로 만들어진 방 ID 응답
+    res.status(201).json({ id: newChatRoomId });
+
+  } catch (err) {
+    // 7. ⭐️ 작업 중 하나라도 실패하면 모두 되돌림
+    await db.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ message: '채팅방 생성 실패' });
+  }
+});
+// ⭐️⭐️⭐️ 여기까지 ⭐️⭐️⭐️
+
 // GET /rooms/:roomId/messages (특정 방의 메시지 목록)
 app.get('/rooms/:roomId/messages', authenticateToken, async (req, res) => {
     const { roomId } = req.params;
@@ -243,7 +288,6 @@ app.post('/rooms/:roomId/messages', authenticateToken, async (req, res) => {
     );
 
     // 3. participants 테이블의 안읽음 카운트 업데이트 (⭐️ 중요 로직)
-    // (보낸 사람(나)은 0, 받는 사람은 1 증가, 숨김 해제)
     await db.query(
       `UPDATE participants SET 
          unread_count = CASE 
@@ -294,7 +338,7 @@ wss.on('connection', (ws, req) => {
 
   let userId;
   try {
-    const payload = jwt.verify(token, JWT_SECRET);
+    const payload = jwt.verify(token, JWT_SECRET); // ⭐️ 대문자 JWT_SECRET
     userId = payload.userId;
     clients[userId] = ws; // ⭐️ 이 유저(userId)는 이 ws 연결을 쓴다고 저장
     console.log(`[WS] 클라이언트 연결됨: ${userId}`);
@@ -342,6 +386,7 @@ async function broadcastMessage(roomId, message) {
     }
   }
 }
+
 
 // ---------------------------------
 // 8. 서버 시작
