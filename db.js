@@ -1,4 +1,4 @@
-// db.js (수정된 코드 👍)
+// db.js (⭐️ 수정본)
 const { Pool } = require('pg');
 require('dotenv').config();
 
@@ -8,14 +8,15 @@ const pool = new Pool({
   database: process.env.DB_DATABASE,
   password: process.env.DB_PASSWORD,
   port: process.env.DB_PORT,
-  
-  // ⭐️⭐️⭐️ 이 코드를 추가하세요! ⭐️⭐️⭐️
   ssl: {
     rejectUnauthorized: false
   }
-  // ⭐️⭐️⭐️⭐️⭐️⭐️⭐️⭐️⭐️⭐️⭐️⭐️⭐️⭐️⭐️⭐️
 });
 
 module.exports = {
+  // ⭐️ 기존 쿼리 (트랜잭션 X)
   query: (text, params) => pool.query(text, params),
+  
+  // ⭐️⭐️⭐️ 트랜잭션을 위해 이 함수를 추가하세요! ⭐️⭐️⭐️
+  getClient: () => pool.connect(),
 };
