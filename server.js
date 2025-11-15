@@ -341,3 +341,44 @@ async function broadcastMessage(roomId, message) {
 server.listen(PORT, () => {
   console.log(`Server (HTTP + WS) listening on port ${PORT}`);
 });
+
+//맵
+//카메라 위치에 따라 표시할 시설 가져오기
+app.get('/facilities', authenticateToken, async (req, res)=>{
+  const {minLat, minLng, maxLat, maxLng} = req.query;
+  if (!minLat || !minLng || !maxLat || !maxLng){
+    return res.status(400).json({message: '지도 경계값을 찾을 수 없음'});
+    }
+  try{
+    const sql = `
+      SELECT * FROM public.facilities_for_map 
+      WHERE ST_Contains(
+        ST_MakeEnvelope($1, $2, $3, $4, 4326), 
+        geom
+      )
+      LIMIT 1000; -- (너무 많은 데이터를 한 번에 보내지 않도록 제한)
+    `;
+    
+    const params = [minLng, minLat, maxLng, maxLat];
+    const result = await db.query(sql, params);
+    const geoJsonFeatures = result.rows.map(row=>{
+      return{
+        type: "Feature",
+        properties: {
+        ...row,
+        cluster: false,
+      },
+      geometry: {
+        type: "Point",
+        coordinates: [row.시설경도, row.시설위도]
+      }
+    }
+  });
+
+    res.json(geoJsonFeatures);
+
+  }catch(err){
+    console.error(err);
+    res.status(500).json({message: '시설 로드 실패'});
+  }
+})
