@@ -550,9 +550,7 @@ app.post('/posts/:postId/join', authenticateToken, async (req, res) => {
 // (locations 테이블을 사용하도록 통일)
 // ---------------------------------
 app.get('/facilities', authenticateToken, async (req, res)=>{
-  console.log('[DEBUG] /facilities 라우트 진입'); 
   const {minLat, minLng, maxLat, maxLng, zoom} = req.query;
-  console.log(`[DEBUG] 쿼리 파라미터: minLat=${minLat}, maxLat=${maxLat}, zoom=${zoom}`);
 
   if (!minLat || !minLng || !maxLat || !maxLng || zoom === undefined){
     console.log('[DEBUG 필수 쿼리 파라미터 누락');
@@ -560,18 +558,16 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
   }
 
   const zoomLevel = parseInt(zoom,10);
-  console.log(`[DEBUG] 파싱된 줌 레벨: ${zoomLevel}`);
   let cellSize;
 
   // 줌 레벨에 따른 클러스터링 셀 크기 조절
   if (zoomLevel < 10){
-    cellSize = 0.1;
+    cellSize = 0.05;
   } else if (zoomLevel < 15){
-    cellSize = 0.02;
+    cellSize = 0.01;
   } else {
-    cellSize = 0.005;
+    cellSize = 0.002;
   }
-  console.log(`[DEBUG] 계산된 셀 크기: ${cellSize}`);
   
   try{
     // ⭐️ 수정: 'facilities_for_map' 대신 'locations' 테이블 사용 (posts API와 통일)
@@ -591,10 +587,8 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
       parseFloat(maxLng),
       parseFloat(maxLat),
     ];
-    console.log(`[DEBUG] SQL 쿼리 파라미터: ${params}`);
     
     const result = await db.query(sql, params);
-    console.log(`[DEBUG] 데이터베이스 쿼리 결과 row 수: ${result.rows.length}`);
     const allFacilitiesInView = result.rows;
 
     // 2. 조회된 시설들을 그리드 기반으로 클러스터링
@@ -614,11 +608,10 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
       }
       clusters[gridKey].push(facility);
     }
-    console.log(`[DEBUG] 클러스터링 완료. 생성된 클러스터 개수: ${Object.keys(clusters).length}`);
 
     // 3. 클라이언트가 렌더링할 수 있는 'ClusterableItem' 형식으로 변환
     const clusterableItems = [];
-    const clusterThreshold = 100; // 100개 이상 모이면 클러스터로 표시
+    const clusterThreshold = 10; // 100개 이상 모이면 클러스터로 표시
 
     for(const gridKey in clusters){
       const facilitiesInCell = clusters[gridKey];
@@ -652,13 +645,11 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
         }
       }
     }
-    console.log(`[DEBUG] 최종 반환할 ClusterableItem 개수: ${clusterableItems.length}`);
     res.json(clusterableItems);
-    console.log('[DEBUG] JSON 응답 전송 완료');
 
   }catch(err){
-    console.error('[ERROR] /facilities 라우트에서 오류 발생:', err);
-    res.status(500).json({message: '시설 로드 실패. DB 스키마(locations)를 확인하세요.'});
+    console.error(err);
+    res.status(500).json({message: '시설 로드 실패'});
   }
 });
 
