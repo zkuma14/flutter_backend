@@ -90,7 +90,7 @@ app.post('/auth/google/login', async (req, res) => {
     if (!user) {
       // ⭐️ DB 스키마에 kakao_id가 없을 수 있으므로 INSERT 문에서 제거
       const newUserResult = await db.query(
-        `INSERT INTO users (display_name, email, google_idpreferred_sport)
+        `INSERT INTO users (display_name, email, google_id, preferred_sport)
          VALUES ($1, $2, $3, $4)
          RETURNING *`,
         [googleName, googleEmail, googleId, '']
