@@ -345,10 +345,23 @@ server.listen(PORT, () => {
 //맵
 //카메라 위치에 따라 표시할 시설 가져오기
 app.get('/facilities', authenticateToken, async (req, res)=>{
-  const {minLat, minLng, maxLat, maxLng} = req.query;
-  if (!minLat || !minLng || !maxLat || !maxLng){
+  const {minLat, minLng, maxLat, maxLng, zoom} = req.query;
+
+  if (!minLat || !minLng || !maxLat || !maxLng || zoom === undefined){
     return res.status(400).json({message: '지도 경계값을 찾을 수 없음'});
     }
+
+    const zoomLevel = parseInt(zoom,10);
+    let cellSize;
+
+    if (zoomLevel < 10){
+      cellSize = 0.1;
+    } else if (zoomLevel < 15){
+      cellSize = 0.02;
+    } else {
+      cellSize = 0.005;
+    }
+  
   try{
     const sql = `
       SELECT * FROM public.facilities_for_map 
@@ -356,29 +369,71 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
         ST_MakeEnvelope($1, $2, $3, $4, 4326), 
         geom
       )
-      LIMIT 1000; -- (너무 많은 데이터를 한 번에 보내지 않도록 제한)
+      LIMIT 5000;
     `;
     
-    const params = [minLng, minLat, maxLng, maxLat];
+    const params = [
+      parseFloat(minLng),
+      parseFloat(minLat),
+      parseFloat(maxLng),
+      parseFloat(maxLat),
+    ];
+
     const result = await db.query(sql, params);
-    const geoJsonFeatures = result.rows.map(row=>{
-      return{
-        type: "Feature",
-        properties: {
-        ...row,
-        cluster: false,
-      },
-      geometry: {
-        type: "Point",
-        coordinates: [row.시설경도, row.시설위도]
+    const allFacilitiesInView = result.rows;
+
+    const clsuters = {};
+
+    for (const facility of allFacilitiesInView){
+      const lat = parseFloat(facility.시설위도);
+      const lng = parseFloat(facility.시설경도);
+
+      const gridLat = Math.floor(lat / cellSize) * cellSize;
+      const gridLng = Math.floor(lng / cellSize) * cellSize;
+      const gridKey = `${gridLat.toFixed(5)}-${gridLng.toFixed(5)}`;
+
+      if (!cluster[gridKey]){
+        clusters[gridKey] = [];
+      }
+      clusters[gridKey.push(facility)];
+    }
+
+    const clusterableItems = [];
+    const clusterThreshold = 100;
+
+    for(const gridKey in clusters){
+      const facilitiesInCell = clusters[gridKey];
+
+      if(facilitiesInCell.length >= clusterThreshold && zoomLevel < 17) {
+        const avgLat = facilitiesInCell.reduce((sum,f) => sum + parseFloat(f.시설위도),0)/facilitiesInCell.length;
+        const avgLng = facilitiesInCell.reduce((sum,f) => sum + parseFloat(f.시설경도),0)/facilitiesInCell.length;
+
+        clusterableItems.push({
+          location: {latitude: avgLat, longitude: avgLng},
+          isCluster: true,
+          count: facilitiesInCell.length,
+          facility: null,
+        });
+      } else {
+        for(const facility of facilitiesInCell){
+          clusterableItems.push({
+            location: {latitude: parseFloat(facility.시설위도), longitude: parseFloat(facility.시설경도)},
+            isCluster: false,
+            facility: {
+              id: facility.id.toString(),
+              name: facility.시설명,
+              iconpath: facility.icon_path || "assets/marker.png",
+            },
+            count: 1,
+          });
+        }
       }
     }
-  });
 
-    res.json(geoJsonFeatures);
+    res.json(clusterableItems);
 
   }catch(err){
     console.error(err);
     res.status(500).json({message: '시설 로드 실패'});
   }
-})
+});
