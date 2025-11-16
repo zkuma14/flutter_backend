@@ -1,4 +1,6 @@
 // server.js (⭐️ Google 인증 + DB 트랜잭션 + Real API 융합본)
+// (DB 스키마가 서버 코드에 맞춰져 있다고 가정하고, snake_case 통신 문제를 수정한 버전)
+
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
@@ -37,6 +39,7 @@ app.post('/auth/login', async (req, res) => {
     if (!user) {
       const dummyEmail = `${Date.now()}@dummy.com`;
       const dummyPassword = 'dummy_password_hash';
+      // ⭐️ DB 스키마에 kakao_id, google_id가 없을 수 있으므로 INSERT 문에서 제거 (사용자 스키마 기반)
       userResult = await db.query(
         `INSERT INTO users (display_name, preferred_sport, email, password_hash) 
            VALUES ($1, $2, $3, $4) 
@@ -86,9 +89,10 @@ app.post('/auth/google/login', async (req, res) => {
 
     // 3. 사용자가 없으면 새로 회원가입
     if (!user) {
+      // ⭐️ DB 스키마에 kakao_id가 없을 수 있으므로 INSERT 문에서 제거
       const newUserResult = await db.query(
-        `INSERT INTO users (display_name, email, google_id, kakao_id, password_hash, preferred_sport)
-         VALUES ($1, $2, $3, NULL, NULL, $4)
+        `INSERT INTO users (display_name, email, google_id, password_hash, preferred_sport)
+         VALUES ($1, $2, $3, NULL, $4)
          RETURNING *`,
         [googleName, googleEmail, googleId, '']
       );
@@ -121,10 +125,10 @@ const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
-  if (token == null) return res.sendStatus(401).json({ message: '인증 토큰이 제공되지 않았습니다.' });
+  if (token == null) return res.sendStatus(401); // 401만 반환 (JSON 메시지 불필요)
 
   jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) return res.sendStatus(403).json({ message: '유효하지 않거나 만료된 토큰입니다.' });
+    if (err) return res.sendStatus(403); // 403만 반환 (JSON 메시지 불필요)
     req.user = user;
     next();
   });
@@ -133,28 +137,35 @@ const authenticateToken = (req, res, next) => {
 // ---------------------------------
 // 👤 4. 사용자 API (프로필)
 // ---------------------------------
+// (hidden_users 테이블이 있다는 가정 하에 원본 유지)
 app.get('/users/me', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const userResult = await db.query('SELECT * FROM users WHERE id = $1', [userId]);
     
+    // hidden_users 테이블이 없다면 이 부분은 오류를 발생시킴
     const hiddenResult = await db.query('SELECT hidden_id FROM hidden_users WHERE hider_id = $1', [userId]);
     const hiddenUsers = hiddenResult.rows.map(row => row.hidden_id);
     
     const user = userResult.rows[0];
-    user.hidden_users = hiddenUsers; 
-
-    res.json(user);
+    if (user) {
+        user.hidden_users = hiddenUsers; 
+        res.json(user);
+    } else {
+        res.status(404).json({ message: '사용자를 찾을 수 없습니다.' });
+    }
   } catch (err) {
     console.error(err);
-    res.status(500).json({ message: '서버 오류' });
+    // ⭐️ DB 스키마가 일치하지 않을 때 'relation "hidden_users" does not exist' 오류 발생
+    res.status(500).json({ message: '서버 오류 또는 DB 스키마 불일치' });
   }
 });
 
 // PUT /users/me (프로필 수정)
 app.put('/users/me', authenticateToken, async (req, res) => {
   const userId = req.user.userId;
-  const { displayName, preferredSport } = req.body;
+  // ⭐️ Flutter에서 camelCase로 보낼 수 있으므로 통일
+  const { displayName, preferredSport } = req.body; 
 
   try {
     const result = await db.query(
@@ -169,6 +180,7 @@ app.put('/users/me', authenticateToken, async (req, res) => {
 });
 
 // GET /users (다른 사용자 목록 - '나'와 '숨긴' 사용자 제외)
+// (hidden_users 테이블이 있다는 가정 하에 원본 유지)
 app.get('/users', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     try {
@@ -186,6 +198,7 @@ app.get('/users', authenticateToken, async (req, res) => {
 });
 
 // POST /users/hide (사용자 숨기기 API)
+// (hidden_users 테이블이 있다는 가정 하에 원본 유지)
 app.post('/users/hide', authenticateToken, async (req, res) => {
   const hiderId = req.user.userId;
   const { userId: hiddenId } = req.body;
@@ -201,6 +214,7 @@ app.post('/users/hide', authenticateToken, async (req, res) => {
 
 // ---------------------------------
 // 💬 5. 채팅방 API (⭐️ DB 트랜잭션 최적화 - File 2)
+// (chat_rooms, participants 테이블이 있다는 가정 하에 원본 유지)
 // ---------------------------------
 // GET /rooms (채팅방 목록)
 app.get('/rooms', authenticateToken, async (req, res) => {
@@ -392,6 +406,7 @@ app.post('/rooms/:roomId/hide', authenticateToken, async (req, res) => {
 
 // ---------------------------------
 // 🏃‍♂️ 6. [신규] 포스트 API (⭐️ Real API - File 2)
+// (DB 스키마가 일치한다고 가정)
 // ---------------------------------
 // GET /posts
 app.get('/posts', authenticateToken, async (req, res) => {
@@ -413,19 +428,34 @@ app.get('/posts', authenticateToken, async (req, res) => {
         res.json(result.rows);
     } catch (err) {
         console.error(err);
-        res.status(500).json({ message: '게시물 로드 실패' });
+        res.status(500).json({ message: '게시물 로드 실패. DB 스키마(posts, locations, post_members)를 확인하세요.' });
     }
 });
 
 // POST /posts
 app.post('/posts', authenticateToken, async (req, res) => {
-    const { title, content, exerciseType, maxPlayers, locationId, exerciseDatetime } = req.body;
+    // ⭐️⭐️⭐️ 수정 ⭐️⭐️⭐️
+    // Flutter(post_model.dart)에서 snake_case로 보낸다고 가정하고 받음
+    const { 
+        title, 
+        content, 
+        exercise_type,     // exerciseType -> exercise_type
+        max_players,       // maxPlayers -> max_players
+        location_id,       // locationId -> location_id
+        exercise_datetime  // exerciseDatetime -> exercise_datetime
+    } = req.body;
     const userId = req.user.userId;
     
+    // ⭐️ 유효성 검사 (필요에 따라 추가)
+    if (!title || !content || !exercise_type || !max_players || !location_id || !exercise_datetime) {
+        return res.status(400).json({ message: '필수 필드가 누락되었습니다.' });
+    }
+
     const client = await db.getClient();
     try {
         await client.query('BEGIN');
-        const roomName = `[${exerciseType}] ${title}`;
+        // ⭐️ 변수명 수정
+        const roomName = `[${exercise_type}] ${title}`;
         const roomResult = await client.query(
           'INSERT INTO chat_rooms (room_name, last_message, last_message_timestamp) VALUES ($1, $2, NOW()) RETURNING id',
           [roomName, '운동 로비가 생성되었습니다.']
@@ -435,7 +465,8 @@ app.post('/posts', authenticateToken, async (req, res) => {
             `INSERT INTO posts (user_id, title, content, exercise_type, max_players, location_id, exercise_datetime, chat_room_id, status)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'RECRUITING')
              RETURNING *`,
-            [userId, title, content, exerciseType, maxPlayers, locationId, exerciseDatetime, newChatRoomId]
+            // ⭐️ 변수명 수정
+            [userId, title, content, exercise_type, max_players, location_id, exercise_datetime, newChatRoomId]
         );
         const newPost = postResult.rows[0];
         await client.query(
@@ -451,7 +482,7 @@ app.post('/posts', authenticateToken, async (req, res) => {
     } catch (err) {
         await client.query('ROLLBACK');
         console.error(err);
-        res.status(500).json({ message: '게시물 생성 실패' });
+        res.status(500).json({ message: '게시물 생성 실패. DB 스키마(posts, chat_rooms, participants, post_members)를 확인하세요.' });
     } finally {
         client.release();
     }
@@ -473,7 +504,12 @@ app.post('/posts/:postId/join', authenticateToken, async (req, res) => {
         if (postResult.rows.length === 0) { throw new Error('게시물을 찾을 수 없습니다.'); }
         const post = postResult.rows[0];
         const { chat_room_id, max_players, current_players } = post;
-        if (current_players >= max_players) { throw new Error('인원이 가득 찼습니다.'); }
+        
+        // ⭐️ COUNT(*)는 문자열(string)로 반환될 수 있으므로, 숫자로 변환하여 비교
+        if (parseInt(current_players, 10) >= parseInt(max_players, 10)) { 
+            throw new Error('인원이 가득 찼습니다.'); 
+        }
+        
         const memberCheck = await client.query(
             'SELECT * FROM post_members WHERE post_id = $1 AND user_id = $2',
             [postId, userId]
@@ -504,6 +540,7 @@ app.post('/posts/:postId/join', authenticateToken, async (req, res) => {
 
 // ---------------------------------
 // 🗺️ 7. [신규] 맵 API (⭐️ Real API / GeoJSON - File 2)
+// (locations 테이블을 사용하도록 통일)
 // ---------------------------------
 app.get('/facilities', authenticateToken, async (req, res)=>{
   const {minLat, minLng, maxLat, maxLng, zoom} = req.query;
@@ -526,10 +563,10 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
   }
   
   try{
-    // 1. PostGIS의 ST_Contains를 사용해 현재 뷰포트 내의 시설만 조회
+    // ⭐️ 수정: 'facilities_for_map' 대신 'locations' 테이블 사용 (posts API와 통일)
     const sql = `
-      SELECT "시설명", "시설유형명", "시설위도", "시설경도"
-      FROM public.facilities_for_map
+      SELECT id, location_name, latitude, longitude, address, icon_path
+      FROM public.locations 
       WHERE ST_Contains(
         ST_MakeEnvelope($1, $2, $3, $4, 4326), 
         geom 
@@ -552,8 +589,8 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
 
     for (const facility of allFacilitiesInView){
       // ⭐️ 'locations' 스키마에 맞게 컬럼명 수정
-      const lat = parseFloat(facility.시설위도);
-      const lng = parseFloat(facility.시설경도);
+      const lat = parseFloat(facility.latitude);
+      const lng = parseFloat(facility.longitude);
 
       const gridLat = Math.floor(lat / cellSize) * cellSize;
       const gridLng = Math.floor(lng / cellSize) * cellSize;
@@ -574,8 +611,9 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
 
       if(facilitiesInCell.length >= clusterThreshold && zoomLevel < 17) {
         // 클러스터로 묶기
-        const avgLat = facilitiesInCell.reduce((sum,f) => sum + parseFloat(f.시설위도), 0) / facilitiesInCell.length;
-        const avgLng = facilitiesInCell.reduce((sum,f) => sum + parseFloat(f.시설경도), 0) / facilitiesInCell.length;
+        // ⭐️ 'locations' 스키마에 맞게 컬럼명 수정
+        const avgLat = facilitiesInCell.reduce((sum,f) => sum + parseFloat(f.latitude), 0) / facilitiesInCell.length;
+        const avgLng = facilitiesInCell.reduce((sum,f) => sum + parseFloat(f.longitude), 0) / facilitiesInCell.length;
 
         clusterableItems.push({
           location: {latitude: avgLat, longitude: avgLng},
@@ -587,13 +625,13 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
         // 개별 마커로 표시
         for(const facility of facilitiesInCell){
           clusterableItems.push({
-            location: {latitude: parseFloat(facility.시설위도), longitude: parseFloat(facility.시설경도)},
+            location: {latitude: parseFloat(facility.latitude), longitude: parseFloat(facility.longitude)},
             isCluster: false,
             facility: {
-              시설명: facility.시설명,
-              시설유형명: facility.시설유형명,
-              시설위도: facility.시설위도,
-              시설경도: facility.시설경도,
+              // ⭐️ 'locations' 스키마에 맞게 컬럼명 수정
+              id: facility.id.toString(),
+              name: facility.location_name,
+              iconpath: facility.icon_path || "assets/marker.png", // icon_path 컬럼
             },
             count: 1,
           });
