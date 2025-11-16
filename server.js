@@ -532,8 +532,8 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
   try{
     // 1. PostGIS의 ST_Contains를 사용해 현재 뷰포트 내의 시설만 조회
     const sql = `
-      SELECT id, location_name, latitude, longitude, address, icon_path
-      FROM public.locations 
+      SELECT "시설명", "시설유형명", "시설위도", "시설경도"
+      FROM public.facilities_for_map
       WHERE ST_Contains(
         ST_MakeEnvelope($1, $2, $3, $4, 4326), 
         geom 
@@ -558,8 +558,8 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
 
     for (const facility of allFacilitiesInView){
       // ⭐️ 'locations' 스키마에 맞게 컬럼명 수정
-      const lat = parseFloat(facility.latitude);
-      const lng = parseFloat(facility.longitude);
+      const lat = parseFloat(facility.시설위도);
+      const lng = parseFloat(facility.시설경도);
 
       const gridLat = Math.floor(lat / cellSize) * cellSize;
       const gridLng = Math.floor(lng / cellSize) * cellSize;
@@ -581,8 +581,8 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
 
       if(facilitiesInCell.length >= clusterThreshold && zoomLevel < 17) {
         // 클러스터로 묶기
-        const avgLat = facilitiesInCell.reduce((sum,f) => sum + parseFloat(f.latitude), 0) / facilitiesInCell.length;
-        const avgLng = facilitiesInCell.reduce((sum,f) => sum + parseFloat(f.longitude), 0) / facilitiesInCell.length;
+        const avgLat = facilitiesInCell.reduce((sum,f) => sum + parseFloat(f.시설위도), 0) / facilitiesInCell.length;
+        const avgLng = facilitiesInCell.reduce((sum,f) => sum + parseFloat(f.시설경도), 0) / facilitiesInCell.length;
 
         clusterableItems.push({
           location: {latitude: avgLat, longitude: avgLng},
@@ -594,13 +594,13 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
         // 개별 마커로 표시
         for(const facility of facilitiesInCell){
           clusterableItems.push({
-            location: {latitude: parseFloat(facility.latitude), longitude: parseFloat(facility.longitude)},
+            location: {latitude: parseFloat(facility.시설위도), longitude: parseFloat(facility.시설경도)},
             isCluster: false,
             facility: {
-              // ⭐️ 'locations' 스키마에 맞게 컬럼명 수정
-              id: facility.id.toString(),
-              name: facility.location_name,
-              iconpath: facility.icon_path || "assets/marker.png", // icon_path 컬럼이 있다고 가정
+              시설명: facility.시설명,
+              시설유형명: facility.시설유형명,
+              시설위도: facility.시설위도,
+              시설경도: facility.시설경도,
             },
             count: 1,
           });
