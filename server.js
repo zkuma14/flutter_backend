@@ -43,7 +43,7 @@ app.post('/auth/login', async (req, res) => {
         `INSERT INTO users (display_name, preferred_sport, email) 
            VALUES ($1, $2, $3) 
            RETURNING *`,
-        [displayName, '', dummyEmail, dummyPassword]
+        [displayName, '', dummyEmail]
       );
       user = userResult.rows[0];
     }
@@ -80,22 +80,22 @@ app.post('/auth/google/login', async (req, res) => {
     const googleEmail = payload['email'];
 
     // 2. DB에서 Google ID로 사용자 조회
-    let userResult = await db.query(
+    let  = await db.query(
       'SELECT * FROM users WHERE google_id = $1',
       [googleId]
     );
-    let user = userResult.rows[0];
+    let user = .rows[0];
 
     // 3. 사용자가 없으면 새로 회원가입
     if (!user) {
       // ⭐️ DB 스키마에 kakao_id가 없을 수 있으므로 INSERT 문에서 제거
-      const newUserResult = await db.query(
+      const new = await db.query(
         `INSERT INTO users (display_name, email, google_id, preferred_sport)
          VALUES ($1, $2, $3, $4)
          RETURNING *`,
         [googleName, googleEmail, googleId, '']
       );
-      user = newUserResult.rows[0];
+      user = new.rows[0];
     }
 
     // 4. 우리 앱의 JWT 토큰 생성
@@ -148,13 +148,13 @@ const authenticateToken = (req, res, next) => {
 app.get('/users/me', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const userResult = await db.query('SELECT * FROM users WHERE id = $1', [userId]);
+    const  = await db.query('SELECT * FROM users WHERE id = $1', [userId]);
     
     // hidden_users 테이블이 없다면 이 부분은 오류를 발생시킴
     const hiddenResult = await db.query('SELECT hidden_id FROM hidden_users WHERE hider_id = $1', [userId]);
     const hiddenUsers = hiddenResult.rows.map(row => row.hidden_id);
     
-    const user = userResult.rows[0];
+    const user = .rows[0];
     if (user) {
         user.hidden_users = hiddenUsers; 
         res.json(user);
