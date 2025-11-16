@@ -80,22 +80,22 @@ app.post('/auth/google/login', async (req, res) => {
     const googleEmail = payload['email'];
 
     // 2. DB에서 Google ID로 사용자 조회
-    let  = await db.query(
+    let userResult = await db.query(
       'SELECT * FROM users WHERE google_id = $1',
       [googleId]
     );
-    let user = .rows[0];
+    let user = userResult.rows[0];
 
     // 3. 사용자가 없으면 새로 회원가입
     if (!user) {
       // ⭐️ DB 스키마에 kakao_id가 없을 수 있으므로 INSERT 문에서 제거
-      const new = await db.query(
+      const newUserResult = await db.query(
         `INSERT INTO users (display_name, email, google_id, preferred_sport)
          VALUES ($1, $2, $3, $4)
          RETURNING *`,
         [googleName, googleEmail, googleId, '']
       );
-      user = new.rows[0];
+      user = newUserResult.rows[0];
     }
 
     // 4. 우리 앱의 JWT 토큰 생성
@@ -148,23 +148,17 @@ const authenticateToken = (req, res, next) => {
 app.get('/users/me', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const  = await db.query('SELECT * FROM users WHERE id = $1', [userId]);
-    
-    // hidden_users 테이블이 없다면 이 부분은 오류를 발생시킴
-    const hiddenResult = await db.query('SELECT hidden_id FROM hidden_users WHERE hider_id = $1', [userId]);
-    const hiddenUsers = hiddenResult.rows.map(row => row.hidden_id);
-    
-    const user = .rows[0];
+    const userResult = await db.query('SELECT * FROM users WHERE id = $1', [userId]);
+    const user = userResult.rows[0];
+
     if (user) {
-        user.hidden_users = hiddenUsers; 
         res.json(user);
     } else {
         res.status(404).json({ message: '사용자를 찾을 수 없습니다.' });
     }
   } catch (err) {
     console.error(err);
-    // ⭐️ DB 스키마가 일치하지 않을 때 'relation "hidden_users" does not exist' 오류 발생
-    res.status(500).json({ message: '서버 오류 또는 DB 스키마 불일치' });
+    res.status(500).json({ message: '서버 오류' });
   }
 });
 
@@ -192,31 +186,31 @@ app.get('/users', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     try {
         const query = `
-            SELECT u.* FROM users u
-            LEFT JOIN hidden_users h ON u.id = h.hidden_id AND h.hider_id = $1
-            WHERE u.id != $1 AND h.hidden_id IS NULL;
+            SELECT * FROM users WHERE id != $1;
         `;
         const result = await db.query(query, [userId]);
         res.json(result.rows);
     } catch (err) {
         console.error(err);
-        res.status(500).json({ message: '사용자 목록 로드 실패' });
+        res.status(500).json({ message: '사용자 목록 로드 실패. DB 스키마를 확인하세요.' });
     }
 });
 
 // POST /users/hide (사용자 숨기기 API)
 // (hidden_users 테이블이 있다는 가정 하에 원본 유지)
-app.post('/users/hide', authenticateToken, async (req, res) => {
-  const hiderId = req.user.userId;
-  const { userId: hiddenId } = req.body;
-  try {
-    await db.query('INSERT INTO hidden_users (hider_id, hidden_id) VALUES ($1, $2)', [hiderId, hiddenId]);
-    res.sendStatus(201);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: '사용자 숨기기 실패' });
-  }
-});
+// ⭐️ 제공된 DB 스키마에 hidden_users 테이블이 없으므로 주석 처리합니다.
+// ⭐️ 필요 시 테이블 생성 후 주석을 해제하여 사용하세요.
+// app.post('/users/hide', authenticateToken, async (req, res) => {
+//   const hiderId = req.user.userId;
+//   const { userId: hiddenId } = req.body;
+//   try {
+//     await db.query('INSERT INTO hidden_users (hider_id, hidden_id) VALUES ($1, $2)', [hiderId, hiddenId]);
+//     res.sendStatus(201);
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).json({ message: '사용자 숨기기 실패' });
+//   }
+// });
 
 
 // ---------------------------------
