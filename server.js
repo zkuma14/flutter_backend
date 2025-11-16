@@ -38,11 +38,10 @@ app.post('/auth/login', async (req, res) => {
     let user = userResult.rows[0];
     if (!user) {
       const dummyEmail = `${Date.now()}@dummy.com`;
-      const dummyPassword = 'dummy_password_hash';
       // ⭐️ DB 스키마에 kakao_id, google_id가 없을 수 있으므로 INSERT 문에서 제거 (사용자 스키마 기반)
       userResult = await db.query(
-        `INSERT INTO users (display_name, preferred_sport, email, password_hash) 
-           VALUES ($1, $2, $3, $4) 
+        `INSERT INTO users (display_name, preferred_sport, email) 
+           VALUES ($1, $2, $3) 
            RETURNING *`,
         [displayName, '', dummyEmail, dummyPassword]
       );
@@ -91,8 +90,8 @@ app.post('/auth/google/login', async (req, res) => {
     if (!user) {
       // ⭐️ DB 스키마에 kakao_id가 없을 수 있으므로 INSERT 문에서 제거
       const newUserResult = await db.query(
-        `INSERT INTO users (display_name, email, google_id, password_hash, preferred_sport)
-         VALUES ($1, $2, $3, NULL, $4)
+        `INSERT INTO users (display_name, email, google_idpreferred_sport)
+         VALUES ($1, $2, $3, $4)
          RETURNING *`,
         [googleName, googleEmail, googleId, '']
       );
