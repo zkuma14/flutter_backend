@@ -567,7 +567,7 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
     // ⭐️ 수정: 'facilities_for_map' 대신 'locations' 테이블 사용 (posts API와 통일)
     const sql = `
       SELECT "시설명", "시설유형명", "시설위도", "시설경도"
-      FROM public.locations 
+      FROM public.facilities_for_map 
       WHERE ST_Contains(
         ST_MakeEnvelope($1, $2, $3, $4, 4326), 
         geom 
