@@ -125,10 +125,18 @@ const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
-  if (token == null) return res.sendStatus(401); // 401만 반환 (JSON 메시지 불필요)
+  if (token == null) {
+    // ⭐️ 응답을 보내고 반드시 함수를 종료(return)해야 합니다.
+    return res.sendStatus(401); // 401 Unauthorized
+  }
 
   jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) return res.sendStatus(403); // 403만 반환 (JSON 메시지 불필요)
+    if (err) {
+      // ⭐️ 응답을 보내고 반드시 함수를 종료(return)해야 합니다.
+      return res.sendStatus(403); // 403 Forbidden
+    }
+    
+    // 성공 시에는 next()를 호출하고 함수를 종료합니다.
     req.user = user;
     next();
   });
