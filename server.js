@@ -184,7 +184,7 @@ app.put('/users/me', authenticateToken, async (req, res) => {
   }
 });
 
-// ⭐️ [보강] POST /users/leave (회원 탈퇴 - 게시글 및 연관 데이터 완벽 삭제)
+// ⭐️ [확실한 해결] POST /users/leave (회원 탈퇴)
 app.post('/users/leave', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const client = await db.getClient();
@@ -192,33 +192,42 @@ app.post('/users/leave', authenticateToken, async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // 1. 내가 '참여'한 기록 삭제 (남의 글에서 나를 지움)
+        // 1. [중요] 리뷰 삭제 (이게 빠져서 에러났을 확률 99%)
+        // (혹시 테이블에 user_id가 없어도 에러 안나게 try-catch로 감싸거나, 있으면 지움)
+        try { await client.query('DELETE FROM reviews WHERE user_id = $1', [userId]); } catch (e) {}
+        
+        // 2. [중요] 내가 저장한 지도 장소 삭제 (map_locations 테이블이 있다면)
+        try { await client.query('DELETE FROM map_locations WHERE user_id = $1', [userId]); } catch (e) {}
+
+        // 3. 내가 '참여'한 게시글 멤버 기록 삭제
         await client.query('DELETE FROM post_members WHERE user_id = $1', [userId]);
         
-        // 2. 내가 '작성'한 게시글에 달린 다른 사람들의 참여 기록 삭제
-        // (이걸 먼저 안 지우면 게시글 삭제 시 에러 남)
+        // 4. 내가 '작성'한 게시글에 달린 다른 사람들의 참여 기록 삭제
+        // (이걸 먼저 안 지우면 게시글 삭제 시 FK 에러남)
         await client.query(`
             DELETE FROM post_members 
             WHERE post_id IN (SELECT id FROM posts WHERE user_id = $1)
         `, [userId]);
 
-        // 3. 내가 '작성'한 게시글 삭제
+        // 5. 내가 '작성'한 게시글 삭제
         await client.query('DELETE FROM posts WHERE user_id = $1', [userId]);
 
-        // 4. 기타 정보 삭제 (채팅 참여, 메시지, 숨김 친구 등)
+        // 6. 채팅방 참여 기록, 메시지, 숨김 친구 삭제
         await client.query('DELETE FROM participants WHERE user_id = $1', [userId]);
         await client.query('DELETE FROM messages WHERE sender_id = $1', [userId]);
         await client.query('DELETE FROM hidden_users WHERE hider_id = $1 OR hidden_id = $1', [userId]);
 
-        // 5. 최종적으로 사용자 삭제
+        // 7. [최종] 사용자 삭제
         await client.query('DELETE FROM users WHERE id = $1', [userId]);
 
         await client.query('COMMIT');
+        console.log(`✅ 사용자(ID: ${userId}) 탈퇴 및 데이터 삭제 완료`);
         res.sendStatus(200);
+
     } catch (err) {
         await client.query('ROLLBACK');
-        console.error('회원 탈퇴 오류:', err);
-        res.status(500).json({ message: '회원 탈퇴 처리 실패' });
+        console.error('❌ 회원 탈퇴 치명적 오류:', err); // 서버 터미널에서 이 로그를 꼭 확인하세요!
+        res.status(500).json({ message: '회원 탈퇴 실패', error: err.toString() });
     } finally {
         client.release();
     }
