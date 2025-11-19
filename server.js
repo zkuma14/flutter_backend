@@ -184,7 +184,7 @@ app.put('/users/me', authenticateToken, async (req, res) => {
   }
 });
 
-// ⭐️ [신규] POST /users/leave (회원 탈퇴)
+// ⭐️ [보강] POST /users/leave (회원 탈퇴 - 게시글 및 연관 데이터 완벽 삭제)
 app.post('/users/leave', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const client = await db.getClient();
@@ -192,17 +192,25 @@ app.post('/users/leave', authenticateToken, async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // 1. 연관된 데이터 삭제 (Foreign Key 제약조건에 따라 순서 중요)
-        // (ON DELETE CASCADE가 설정되어 있다면 users만 지워도 되지만, 안전하게 명시)
+        // 1. 내가 '참여'한 기록 삭제 (남의 글에서 나를 지움)
         await client.query('DELETE FROM post_members WHERE user_id = $1', [userId]);
+        
+        // 2. 내가 '작성'한 게시글에 달린 다른 사람들의 참여 기록 삭제
+        // (이걸 먼저 안 지우면 게시글 삭제 시 에러 남)
+        await client.query(`
+            DELETE FROM post_members 
+            WHERE post_id IN (SELECT id FROM posts WHERE user_id = $1)
+        `, [userId]);
+
+        // 3. 내가 '작성'한 게시글 삭제
+        await client.query('DELETE FROM posts WHERE user_id = $1', [userId]);
+
+        // 4. 기타 정보 삭제 (채팅 참여, 메시지, 숨김 친구 등)
         await client.query('DELETE FROM participants WHERE user_id = $1', [userId]);
         await client.query('DELETE FROM messages WHERE sender_id = $1', [userId]);
         await client.query('DELETE FROM hidden_users WHERE hider_id = $1 OR hidden_id = $1', [userId]);
-        
-        // 사용자가 작성한 게시글 삭제 (옵션: 게시글은 남길지 삭제할지 결정. 여기선 삭제)
-        await client.query('DELETE FROM posts WHERE user_id = $1', [userId]);
 
-        // 2. 사용자 삭제
+        // 5. 최종적으로 사용자 삭제
         await client.query('DELETE FROM users WHERE id = $1', [userId]);
 
         await client.query('COMMIT');
