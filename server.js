@@ -435,58 +435,89 @@ app.get('/posts', authenticateToken, async (req, res) => {
 
 // POST /posts
 app.post('/posts', authenticateToken, async (req, res) => {
-    // ⭐️⭐️⭐️ 수정 ⭐️⭐️⭐️
-    // Flutter(post_model.dart)에서 snake_case로 보낸다고 가정하고 받음
-    const { 
-        title, 
-        content, 
-        exercise_type,     // exerciseType -> exercise_type
-        max_players,       // maxPlayers -> max_players
-        location_id,       // locationId -> location_id
-        exercise_datetime  // exerciseDatetime -> exercise_datetime
-    } = req.body;
-    const userId = req.user.userId;
-    
-    // ⭐️ 유효성 검사 (필요에 따라 추가)
-    if (!title || !content || !exercise_type || !max_players || !location_id || !exercise_datetime) {
-        return res.status(400).json({ message: '필수 필드가 누락되었습니다.' });
-    }
+  const { 
+    title, 
+    content, 
+    exercise_type,   
+    max_players, 
+    location_name,   
+    exercise_datetime 
+  } = req.body;
 
-    const client = await db.getClient();
-    try {
-        await client.query('BEGIN');
-        // ⭐️ 변수명 수정
-        const roomName = `[${exercise_type}] ${title}`;
-        const roomResult = await client.query(
-          'INSERT INTO chat_rooms (room_name, last_message, last_message_timestamp) VALUES ($1, $2, NOW()) RETURNING id',
-          [roomName, '운동 로비가 생성되었습니다.']
-        );
-        const newChatRoomId = roomResult.rows[0].id;
-        const postResult = await client.query(
-            `INSERT INTO posts (user_id, title, content, exercise_type, max_players, location_id, exercise_datetime, chat_room_id, status)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'RECRUITING')
-             RETURNING *`,
-            // ⭐️ 변수명 수정
-            [userId, title, content, exercise_type, max_players, location_id, exercise_datetime, newChatRoomId]
-        );
-        const newPost = postResult.rows[0];
-        await client.query(
-            'INSERT INTO participants (chat_room_id, user_id) VALUES ($1, $2)',
-            [newChatRoomId, userId]
-        );
-        await client.query(
-            'INSERT INTO post_members (post_id, user_id) VALUES ($1, $2)',
-            [newPost.id, userId]
-        );
-        await client.query('COMMIT');
-        res.status(201).json(newPost);
-    } catch (err) {
-        await client.query('ROLLBACK');
-        console.error(err);
-        res.status(500).json({ message: '게시물 생성 실패. DB 스키마(posts, chat_rooms, participants, post_members)를 확인하세요.' });
-    } finally {
-        client.release();
+  const userId = req.user.userId;
+
+  if (!title || !exercise_type) {
+    console.log("❌ 필수 데이터 누락됨");
+    return res.status(400).json({ message: '필수 정보가 누락되었습니다.' });
+  }
+
+  const client = await db.getClient();
+  try {
+    await client.query('BEGIN');
+
+    // -------------------------------------------------------
+    // ⭐️ 3. [핵심] 장소 ID 자동 처리 로직 (Clean DB 유지 비결)
+    // -------------------------------------------------------
+    let finalLocationId;
+    
+    // A. 이름으로 이미 존재하는 장소인지 확인
+    const locCheck = await client.query(
+      'SELECT id FROM locations WHERE location_name = $1', 
+      [location_name]
+    );
+
+    if (locCheck.rows.length > 0) {
+      // B. 이미 있으면 그 ID 사용
+      finalLocationId = locCheck.rows[0].id;
+    } else {
+      // C. 없으면 "새로 만들어서" ID 생성 (좌표는 임시로 0,0 처리)
+      // 만약 DB의 locations 테이블에 latitude, longitude가 NOT NULL이라면 0.0이라도 넣어야 함
+      const newLoc = await client.query(
+        `INSERT INTO locations (location_name, latitude, longitude, address) 
+         VALUES ($1, 0.0, 0.0, $1) 
+         RETURNING id`,
+        [location_name]
+      );
+      finalLocationId = newLoc.rows[0].id;
     }
+    // -------------------------------------------------------
+
+    // 채팅방 생성
+    const roomName = `[${exercise_type}] ${title}`;
+    const roomResult = await client.query(
+      'INSERT INTO chat_rooms (room_name, last_message, last_message_timestamp) VALUES ($1, $2, NOW()) RETURNING id',
+      [roomName, '운동 로비가 생성되었습니다.']
+    );
+    const newChatRoomId = roomResult.rows[0].id;
+
+    // 게시글 생성 (자동으로 구한 finalLocationId 사용)
+    const postResult = await client.query(
+        `INSERT INTO posts (user_id, title, content, exercise_type, max_players, location_id, exercise_datetime, chat_room_id, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'RECRUITING')
+         RETURNING *`,
+        [userId, title, content, exercise_type, max_players, finalLocationId, exercise_datetime, newChatRoomId]
+    );
+    const newPost = postResult.rows[0];
+
+    await client.query(
+        'INSERT INTO participants (chat_room_id, user_id) VALUES ($1, $2)',
+        [newChatRoomId, userId]
+    );
+    await client.query(
+        'INSERT INTO post_members (post_id, user_id) VALUES ($1, $2)',
+        [newPost.id, userId]
+    );
+
+    await client.query('COMMIT');
+    res.status(201).json(newPost);
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error("게시물 생성 에러:", err);
+    res.status(500).json({ message: '게시물 생성 실패', error: err.toString() });
+  } finally {
+    client.release();
+  }
 });
 
 // POST /posts/:postId/join
