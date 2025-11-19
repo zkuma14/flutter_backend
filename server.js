@@ -214,11 +214,13 @@ app.post('/users/leave', authenticateToken, async (req, res) => {
         await client.query('DELETE FROM users WHERE id = $1', [userId]);
 
         await client.query('COMMIT');
+        console.log(`✅ 사용자(ID: ${userId}) 탈퇴 및 데이터 삭제 완료`);
         res.sendStatus(200);
+
     } catch (err) {
         await client.query('ROLLBACK');
-        console.error('회원 탈퇴 오류:', err);
-        res.status(500).json({ message: '회원 탈퇴 처리 실패' });
+        console.error('❌ 회원 탈퇴 치명적 오류:', err); // 서버 터미널에서 이 로그를 꼭 확인하세요!
+        res.status(500).json({ message: '회원 탈퇴 실패', error: err.toString() });
     } finally {
         client.release();
     }
@@ -641,7 +643,10 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
   try{
     // ⭐️ 수정: 'facilities_for_map' 대신 'locations' 테이블 사용 (posts API와 통일)
     const sql = `
-      SELECT "시설명", "시설유형명", "시설위도", "시설경도"
+      SELECT "시설명", "시설유형명", "시설위도", "시설경도",
+      "시설상태값',"도로명우편주소","주소","시설주소2명",
+      "시설전화번호","시설홈페이지URL","담당자전화번호","실내외구분명",
+      "준공일자",
       FROM public.facilities_for_map 
       WHERE ST_Contains(
         ST_MakeEnvelope($1, $2, $3, $4, 4326), 
@@ -708,6 +713,15 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
               시설유형명: facility.시설유형명,
               시설위도: facility.시설위도,
               시설경도: facility.시설경도,
+              시설상태값: facility.시설상태값,
+              도로명우편주소: facility.도로명우편주소,
+              주소: facility.주소,
+              시설주소2명: facility.시설주소2명,
+              시설전화번호: facility.시설전화번호,
+              시설홈페이지URL: facility.시설홈페이지URL,
+              담당자전화번호: facility.담당자전화번호,
+              실내외구분명: facility.실내외구분명,
+              준공일자: facility.준공일자,
             },
             count: 1,
           });
