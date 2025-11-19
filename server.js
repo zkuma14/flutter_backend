@@ -162,22 +162,58 @@ app.get('/users/me', authenticateToken, async (req, res) => {
   }
 });
 
-// PUT /users/me (프로필 수정)
+// ⭐️ [수정] PUT /users/me (프로필 수정 - 생년월일 추가)
 app.put('/users/me', authenticateToken, async (req, res) => {
   const userId = req.user.userId;
-  // ⭐️ Flutter에서 camelCase로 보낼 수 있으므로 통일
-  const { displayName, preferredSport } = req.body; 
+  // birthDate 추가됨
+  const { displayName, preferredSport, birthDate } = req.body;
 
   try {
+    // birth_date 컬럼 업데이트 추가
     const result = await db.query(
-      'UPDATE users SET display_name = $1, preferred_sport = $2 WHERE id = $3 RETURNING *',
-      [displayName, preferredSport, userId]
+      `UPDATE users 
+       SET display_name = $1, preferred_sport = $2, birth_date = $3 
+       WHERE id = $4 
+       RETURNING *`,
+      [displayName, preferredSport, birthDate, userId]
     );
     res.json(result.rows[0]);
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: '프로필 업데이트 실패' });
   }
+});
+
+// ⭐️ [신규] POST /users/leave (회원 탈퇴)
+app.post('/users/leave', authenticateToken, async (req, res) => {
+    const userId = req.user.userId;
+    const client = await db.getClient();
+
+    try {
+        await client.query('BEGIN');
+
+        // 1. 연관된 데이터 삭제 (Foreign Key 제약조건에 따라 순서 중요)
+        // (ON DELETE CASCADE가 설정되어 있다면 users만 지워도 되지만, 안전하게 명시)
+        await client.query('DELETE FROM post_members WHERE user_id = $1', [userId]);
+        await client.query('DELETE FROM participants WHERE user_id = $1', [userId]);
+        await client.query('DELETE FROM messages WHERE sender_id = $1', [userId]);
+        await client.query('DELETE FROM hidden_users WHERE hider_id = $1 OR hidden_id = $1', [userId]);
+        
+        // 사용자가 작성한 게시글 삭제 (옵션: 게시글은 남길지 삭제할지 결정. 여기선 삭제)
+        await client.query('DELETE FROM posts WHERE user_id = $1', [userId]);
+
+        // 2. 사용자 삭제
+        await client.query('DELETE FROM users WHERE id = $1', [userId]);
+
+        await client.query('COMMIT');
+        res.sendStatus(200);
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('회원 탈퇴 오류:', err);
+        res.status(500).json({ message: '회원 탈퇴 처리 실패' });
+    } finally {
+        client.release();
+    }
 });
 
 // GET /users (다른 사용자 목록 - '나'와 '숨긴' 사용자 제외)
