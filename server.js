@@ -580,6 +580,10 @@ app.post('/posts', authenticateToken, async (req, res) => {
     );
     const newPost = postResult.rows[0];
 
+    newPost.author_name = is_anonymous ? '익명' : userDisplayName;
+    newPost.location_name = location_name; // (선택사항) 장소 이름도 바로 보여주려면 추가
+    newPost.current_players = 1; // 방금 만들었으니 1명
+
     // 3. 채팅방 참여자 등록 (방장 이름 설정)
     // 익명이면 '글쓴이', 아니면 실제 이름
     const leaderChatName = is_anonymous ? '글쓴이' : userDisplayName;
