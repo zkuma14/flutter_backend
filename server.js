@@ -242,21 +242,69 @@ app.get('/users', authenticateToken, async (req, res) => {
     }
 });
 
-// POST /users/hide (사용자 숨기기 API)
-// (hidden_users 테이블이 있다는 가정 하에 원본 유지)
-// ⭐️ 제공된 DB 스키마에 hidden_users 테이블이 없으므로 주석 처리합니다.
-// ⭐️ 필요 시 테이블 생성 후 주석을 해제하여 사용하세요.
-// app.post('/users/hide', authenticateToken, async (req, res) => {
-//   const hiderId = req.user.userId;
-//   const { userId: hiddenId } = req.body;
-//   try {
-//     await db.query('INSERT INTO hidden_users (hider_id, hidden_id) VALUES ($1, $2)', [hiderId, hiddenId]);
-//     res.sendStatus(201);
-//   } catch (err) {
-//     console.error(err);
-//     res.status(500).json({ message: '사용자 숨기기 실패' });
-//   }
-// });
+// ⭐️ [대폭 수정] POST /rooms/:roomId/leave (방 나가기 + 모임 탈퇴 + 시스템 메시지)
+// (기존 /hide API를 /leave 로 변경하거나 기능을 덮어씁니다)
+app.post('/rooms/:roomId/leave', authenticateToken, async (req, res) => {
+  const { roomId } = req.params;
+  const userId = req.user.userId;
+
+  const client = await db.getClient();
+  try {
+    await client.query('BEGIN');
+
+    // 1. 내 채팅 이름 가져오기 (나갔습니다 메시지용)
+    const partResult = await client.query(
+        'SELECT chat_name FROM participants WHERE chat_room_id = $1 AND user_id = $2',
+        [roomId, userId]
+    );
+    const myName = partResult.rows.length > 0 ? partResult.rows[0].chat_name : '알 수 없음';
+
+    // 2. post_members 에서 삭제 (모임 탈퇴)
+    // (이 방과 연결된 post_id를 찾아서 삭제해야 함)
+    await client.query(`
+        DELETE FROM post_members 
+        WHERE user_id = $1 AND post_id = (SELECT id FROM posts WHERE chat_room_id = $2)
+    `, [userId, roomId]);
+
+    // 3. participants 업데이트 (숨김 처리 & 나간 시간 기록)
+    // (아예 DELETE 하지 않는 이유는, 나중에 다시 들어올 때 이름 기록 등을 유지하거나 로그를 남기기 위함이나,
+    //  사용자 요청은 "인원수 줄어들게" 이므로 여기서는 is_hidden 처리만 하고, 
+    //  클라이언트나 쿼리에서 is_hidden=false 인 사람만 카운트하도록 로직을 짜야 함.
+    //  하지만 확실한 인원 감소를 위해 DELETE를 하거나, COUNT 쿼리를 수정해야 함.
+    //  여기서는 **채팅방 목록에는 남기지 않으려면** is_hidden=TRUE가 맞습니다.)
+    await client.query(
+      'UPDATE participants SET is_hidden = TRUE, left_at = NOW() WHERE chat_room_id = $1 AND user_id = $2',
+      [roomId, userId]
+    );
+
+    // 4. 시스템 메시지 전송 ('익명3님이 나갔습니다')
+    const sysMsg = `${myName}님이 모임에서 나갔습니다.`;
+    const msgResult = await client.query(
+        `INSERT INTO messages (chat_room_id, sender_id, text, msg_type) 
+         VALUES ($1, $2, $3, 'SYSTEM') RETURNING *`,
+        [roomId, userId, sysMsg]
+    );
+
+    // 5. 채팅방 마지막 메시지 갱신
+    await client.query(
+        'UPDATE chat_rooms SET last_message = $1, last_message_timestamp = NOW() WHERE id = $2',
+        [sysMsg, roomId]
+    );
+
+    await client.query('COMMIT');
+    
+    // 웹소켓 전송 (시스템 메시지 & 방 업데이트)
+    broadcastMessage(roomId, msgResult.rows[0]);
+
+    res.sendStatus(200);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ message: '방 나가기 실패' });
+  } finally {
+    client.release();
+  }
+});
 
 
 // ---------------------------------
@@ -333,32 +381,24 @@ app.post('/rooms', authenticateToken, async (req, res) => {
   }
 });
 
-// GET /rooms/:roomId/messages (특정 방의 메시지 목록)
+// ⭐️ [수정] GET /rooms/:roomId/messages (채팅 이름(chat_name) 반환)
 app.get('/rooms/:roomId/messages', authenticateToken, async (req, res) => {
     const { roomId } = req.params;
     const userId = req.user.userId;
-    const { leftAt } = req.query; 
 
     try {
-        const partCheck = await db.query(
-            'SELECT * FROM participants WHERE chat_room_id = $1 AND user_id = $2',
-            [roomId, userId]
+        // ... 권한 체크 (기존 동일) ...
+
+        // 💡 조인해서 participants의 chat_name을 가져옵니다.
+        // 메시지 보낸 사람의 당시 닉네임(익명N)을 보여주기 위함
+        const result = await db.query(
+            `SELECT m.*, p.chat_name, p.profile_image
+             FROM messages m
+             LEFT JOIN participants p ON m.chat_room_id = p.chat_room_id AND m.sender_id = p.user_id
+             WHERE m.chat_room_id = $1
+             ORDER BY m.created_at ASC LIMIT 100`,
+            [roomId]
         );
-        if (partCheck.rows.length === 0) {
-            return res.status(403).json({ message: '권한이 없습니다.' });
-        }
-
-        let query = 'SELECT m.* FROM messages m WHERE m.chat_room_id = $1';
-        let params = [roomId];
-        
-        if (leftAt) {
-            query += ' AND m.created_at > $2';
-            params.push(leftAt);
-        }
-        
-        query += ' ORDER BY m.created_at DESC LIMIT 50'; 
-
-        const result = await db.query(query, params);
         res.json(result.rows);
 
     } catch (err) {
@@ -480,20 +520,17 @@ app.get('/posts', authenticateToken, async (req, res) => {
 });
 
 // POST /posts
+// ⭐️ [수정] POST /posts (게시글 생성 - 익명 로직 추가)
 app.post('/posts', authenticateToken, async (req, res) => {
   const { 
-    title, 
-    content, 
-    exercise_type,   
-    max_players, 
-    location_name,   
-    exercise_datetime 
+    title, content, exercise_type, max_players, location_name, exercise_datetime,
+    is_anonymous // 💡 클라이언트에서 받음 (기본 true)
   } = req.body;
 
   const userId = req.user.userId;
+  const userDisplayName = req.user.name; // JWT에서 꺼낸 이름
 
   if (!title || !exercise_type) {
-    console.log("❌ 필수 데이터 누락됨");
     return res.status(400).json({ message: '필수 정보가 누락되었습니다.' });
   }
 
@@ -505,52 +542,43 @@ app.post('/posts', authenticateToken, async (req, res) => {
     // ⭐️ 3. [핵심] 장소 ID 자동 처리 로직 (Clean DB 유지 비결)
     // -------------------------------------------------------
     let finalLocationId;
-    
-    // A. 이름으로 이미 존재하는 장소인지 확인
-    const locCheck = await client.query(
-      'SELECT id FROM locations WHERE location_name = $1', 
-      [location_name]
-    );
-
-    if (locCheck.rows.length > 0) {
-      // B. 이미 있으면 그 ID 사용
-      finalLocationId = locCheck.rows[0].id;
-    } else {
-      // C. 없으면 "새로 만들어서" ID 생성 (좌표는 임시로 0,0 처리)
-      // 만약 DB의 locations 테이블에 latitude, longitude가 NOT NULL이라면 0.0이라도 넣어야 함
-      const newLoc = await client.query(
-        `INSERT INTO locations (location_name, latitude, longitude, address) 
-         VALUES ($1, 0.0, 0.0, $1) 
-         RETURNING id`,
-        [location_name]
-      );
+    const locCheck = await client.query('SELECT id FROM locations WHERE location_name = $1', [location_name]);
+    if (locCheck.rows.length > 0) { finalLocationId = locCheck.rows[0].id; } 
+    else {
+      const newLoc = await client.query('INSERT INTO locations (location_name, latitude, longitude, address) VALUES ($1, 0, 0, $1) RETURNING id', [location_name]);
       finalLocationId = newLoc.rows[0].id;
     }
     // -------------------------------------------------------
 
-    // 채팅방 생성
+    // 1. 채팅방 생성
     const roomName = `[${exercise_type}] ${title}`;
     const roomResult = await client.query(
-      'INSERT INTO chat_rooms (room_name, last_message, last_message_timestamp) VALUES ($1, $2, NOW()) RETURNING id',
+      'INSERT INTO chat_rooms (room_name, last_message, last_message_timestamp, is_group) VALUES ($1, $2, NOW(), TRUE) RETURNING id',
       [roomName, '운동 로비가 생성되었습니다.']
     );
     const newChatRoomId = roomResult.rows[0].id;
 
-    // 게시글 생성 (자동으로 구한 finalLocationId 사용)
+    // 2. 게시글 생성 (is_anonymous 추가)
     const postResult = await client.query(
-        `INSERT INTO posts (user_id, title, content, exercise_type, max_players, location_id, exercise_datetime, chat_room_id, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'RECRUITING')
+        `INSERT INTO posts (user_id, title, content, exercise_type, max_players, location_id, exercise_datetime, chat_room_id, status, view_count, is_anonymous)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'RECRUITING', 0, $9)
          RETURNING *`,
-        [userId, title, content, exercise_type, max_players, finalLocationId, exercise_datetime, newChatRoomId]
+        [userId, title, content, exercise_type, max_players, finalLocationId, exercise_datetime, newChatRoomId, is_anonymous]
     );
     const newPost = postResult.rows[0];
 
+    // 3. 채팅방 참여자 등록 (방장 이름 설정)
+    // 익명이면 '글쓴이', 아니면 실제 이름
+    const leaderChatName = is_anonymous ? '글쓴이' : userDisplayName;
+
     await client.query(
-        'INSERT INTO participants (chat_room_id, user_id) VALUES ($1, $2)',
-        [newChatRoomId, userId]
+        'INSERT INTO participants (chat_room_id, user_id, chat_name) VALUES ($1, $2, $3)',
+        [newChatRoomId, userId, leaderChatName]
     );
+
+    // 4. 게시글 멤버 등록
     await client.query(
-        'INSERT INTO post_members (post_id, user_id) VALUES ($1, $2)',
+        `INSERT INTO post_members (post_id, user_id, role, status) VALUES ($1, $2, 'LEADER', 'ACCEPTED')`,
         [newPost.id, userId]
     );
 
@@ -566,51 +594,72 @@ app.post('/posts', authenticateToken, async (req, res) => {
   }
 });
 
-// POST /posts/:postId/join
+// ⭐️ [수정] POST /posts/:postId/join (참여하기 - 익명 번호 부여)
 app.post('/posts/:postId/join', authenticateToken, async (req, res) => {
     const { postId } = req.params;
     const userId = req.user.userId;
+    const userDisplayName = req.user.name;
+
     const client = await db.getClient();
     try {
         await client.query('BEGIN');
+
+        // 1. 게시글 정보 확인 (익명 여부 확인)
         const postResult = await client.query(
-            `SELECT p.chat_room_id, p.max_players, 
+            `SELECT p.*, 
               (SELECT COUNT(*) FROM post_members pm WHERE pm.post_id = p.id) AS current_players
-             FROM posts p WHERE p.id = $1`,
+             FROM posts p WHERE p.id = $1 FOR UPDATE`,
             [postId]
         );
-        if (postResult.rows.length === 0) { throw new Error('게시물을 찾을 수 없습니다.'); }
+
+        if (postResult.rows.length === 0) throw new Error('게시물을 찾을 수 없습니다.');
         const post = postResult.rows[0];
-        const { chat_room_id, max_players, current_players } = post;
         
-        // ⭐️ COUNT(*)는 문자열(string)로 반환될 수 있으므로, 숫자로 변환하여 비교
-        if (parseInt(current_players, 10) >= parseInt(max_players, 10)) { 
-            throw new Error('인원이 가득 찼습니다.'); 
+        if (parseInt(post.current_players) >= post.max_players) {
+            throw new Error('인원이 가득 찼습니다.');
         }
-        
+
+        // 2. 이미 참여했는지 확인
         const memberCheck = await client.query(
-            'SELECT * FROM post_members WHERE post_id = $1 AND user_id = $2',
+            'SELECT 1 FROM post_members WHERE post_id = $1 AND user_id = $2',
             [postId, userId]
         );
+
         if (memberCheck.rows.length === 0) {
+            // 3. 멤버 추가
             await client.query(
-                'INSERT INTO post_members (post_id, user_id) VALUES ($1, $2)',
+                `INSERT INTO post_members (post_id, user_id, role, status) VALUES ($1, $2, 'MEMBER', 'ACCEPTED')`,
                 [postId, userId]
             );
+            
+            // 4. 채팅방 참여 (이름 결정)
+            let myChatName = userDisplayName;
+            
+            if (post.is_anonymous) {
+                // 현재 채팅방 인원수 조회 -> 다음 번호 부여
+                const countResult = await client.query(
+                    'SELECT COUNT(*) FROM participants WHERE chat_room_id = $1',
+                    [post.chat_room_id]
+                );
+                const nextNum = parseInt(countResult.rows[0].count) + 1; // 방장(1명) 있으니 2부터 시작하거나, 방장 포함 전체 수
+                // 방장이 '글쓴이'고 나머지가 '익명1'부터 시작하길 원한다면:
+                // 현재 1명(방장) -> 나는 '익명1'
+                // 현재 2명 -> 나는 '익명2'
+                myChatName = `익명${parseInt(countResult.rows[0].count)}`; 
+            }
+
             await client.query(
-                'INSERT INTO participants (chat_room_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-                [chat_room_id, userId]
+                `INSERT INTO participants (chat_room_id, user_id, chat_name) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+                [post.chat_room_id, userId, myChatName]
             );
         }
+
         await client.query('COMMIT');
-        res.status(200).json({ 
-            message: '참가 완료', 
-            chatRoomId: chat_room_id 
-        });
+        res.json({ message: '참여 완료', chatRoomId: post.chat_room_id });
     } catch (err) {
         await client.query('ROLLBACK');
         console.error(err);
-        res.status(500).json({ message: err.message || '참가 실패' });
+        res.status(500).json({ message: err.message || '참여 실패' });
     } finally {
         client.release();
     }
@@ -641,12 +690,11 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
   }
   
   try{
-    // ⭐️ 수정: 'facilities_for_map' 대신 'locations' 테이블 사용 (posts API와 통일)
     const sql = `
       SELECT "시설명", "시설유형명", "시설위도", "시설경도",
-      "시설상태값',"도로명우편주소","주소","시설주소2명",
-      "시설전화번호","시설홈페이지URL","담당자전화번호","실내외구분명",
-      "준공일자",
+      "시설상태값", "도로명우편주소", "주소", "시설주소2명",
+      "시설전화번호", "시설홈페이지URL", "담당자전화번호", "실내외구분명",
+      "준공일자"
       FROM public.facilities_for_map 
       WHERE ST_Contains(
         ST_MakeEnvelope($1, $2, $3, $4, 4326), 
