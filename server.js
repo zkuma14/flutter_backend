@@ -694,7 +694,7 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
       SELECT "시설명", "시설유형명", "시설위도", "시설경도",
       "시설상태값", "도로명우편주소", "주소", "시설주소2명",
       "시설전화번호", "시설홈페이지URL", "담당자전화번호", "실내외구분명",
-      "준공일자"
+      "준공일자" 
       FROM facilities_for_map 
       WHERE ST_Contains(
         ST_MakeEnvelope($1, $2, $3, $4, 4326), 
@@ -758,12 +758,19 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
             location: {latitude: parseFloat(facility.시설위도), longitude: parseFloat(facility.시설경도)},
             isCluster: false,
             facility: {
-              // Dart 모델(Facility.fromJson)과 키 이름을 맞춰줍니다.
-              id: facility.시설명, // ID가 따로 없으면 시설명 사용
-              name: facility.시설명,
-              // 나머지 정보들은 필요시 추가 (지금은 map_non_realtime.dart에서 쓰는 것 위주로)
-              시설유형명: facility.시설유형명, 
-              iconpath: "assets/marker.png", // 기본 아이콘 (유형별 처리는 클라이언트가 함)
+              시설명: facility.시설명,
+              시설유형명: facility.시설유형명,
+              시설위도: facility.시설위도,
+              시설경도: facility.시설경도,
+              시설상태값: facility.시설상태값,
+              도로명우편주소: facility.도로명우편주소,
+              주소: facility.주소,
+              시설주소2명: facility.시설주소2명,
+              시설전화번호: facility.시설전화번호,
+              시설홈페이지URL: facility.시설홈페이지URL,
+              담당자전화번호: facility.담당자전화번호,
+              실내외구분명: facility.실내외구분명,
+              준공일자: facility.준공일자,
             },
             count: 1,
           });
