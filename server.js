@@ -644,9 +644,9 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
     // ⭐️ 수정: 'facilities_for_map' 대신 'locations' 테이블 사용 (posts API와 통일)
     const sql = `
       SELECT "시설명", "시설유형명", "시설위도", "시설경도",
-      "시설상태값',"도로명우편주소","주소","시설주소2명",
+      "시설상태값","도로명우편번호","주소","시설주소2명",
       "시설전화번호","시설홈페이지URL","담당자전화번호","실내외구분명",
-      "준공일자",
+      "준공일자"
       FROM public.facilities_for_map 
       WHERE ST_Contains(
         ST_MakeEnvelope($1, $2, $3, $4, 4326), 
@@ -714,7 +714,7 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
               시설위도: facility.시설위도,
               시설경도: facility.시설경도,
               시설상태값: facility.시설상태값,
-              도로명우편주소: facility.도로명우편주소,
+              도로명우편번호: facility.도로명우편번호,
               주소: facility.주소,
               시설주소2명: facility.시설주소2명,
               시설전화번호: facility.시설전화번호,
