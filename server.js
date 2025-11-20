@@ -666,14 +666,12 @@ app.post('/posts/:postId/join', authenticateToken, async (req, res) => {
 });
 
 // ---------------------------------
-// 🗺️ 7. [신규] 맵 API (⭐️ Real API / GeoJSON - File 2)
-// (locations 테이블을 사용하도록 통일)
+// 🗺️ 7. 맵 API (시설 정보 조회)
 // ---------------------------------
 app.get('/facilities', authenticateToken, async (req, res)=>{
   const {minLat, minLng, maxLat, maxLng, zoom} = req.query;
 
   if (!minLat || !minLng || !maxLat || !maxLng || zoom === undefined){
-    console.log('[DEBUG 필수 쿼리 파라미터 누락');
     return res.status(400).json({message: '지도 경계값을 찾을 수 없음'});
   }
 
@@ -690,12 +688,14 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
   }
   
   try{
+    // ⭐️ [수정] 쉼표(,) 오타를 완벽하게 제거한 쿼리
+    // "준공일자" 뒤에 쉼표가 없어야 합니다!
     const sql = `
       SELECT "시설명", "시설유형명", "시설위도", "시설경도",
-      "시설상태값","도로명우편번호","주소","시설주소2명",
-      "시설전화번호","시설홈페이지URL","담당자전화번호","실내외구분명",
+      "시설상태값", "도로명우편주소", "주소", "시설주소2명",
+      "시설전화번호", "시설홈페이지URL", "담당자전화번호", "실내외구분명",
       "준공일자"
-      FROM public.facilities_for_map 
+      FROM facilities_for_map 
       WHERE ST_Contains(
         ST_MakeEnvelope($1, $2, $3, $4, 4326), 
         geom 
@@ -717,9 +717,11 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
     const clusters = {};
 
     for (const facility of allFacilitiesInView){
-      // ⭐️ 'locations' 스키마에 맞게 컬럼명 수정
+      // DB 컬럼이 한글이므로 한글 Key로 접근
       const lat = parseFloat(facility.시설위도);
       const lng = parseFloat(facility.시설경도);
+
+      if (isNaN(lat) || isNaN(lng)) continue; // 좌표 오류 시 건너뜀
 
       const gridLat = Math.floor(lat / cellSize) * cellSize;
       const gridLng = Math.floor(lng / cellSize) * cellSize;
@@ -731,16 +733,15 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
       clusters[gridKey].push(facility);
     }
 
-    // 3. 클라이언트가 렌더링할 수 있는 'ClusterableItem' 형식으로 변환
+    // 3. 클라이언트 포맷(ClusterableItem)으로 변환
     const clusterableItems = [];
-    const clusterThreshold = 10; // 100개 이상 모이면 클러스터로 표시
+    const clusterThreshold = 5; // 5개 이상이면 묶음
 
     for(const gridKey in clusters){
       const facilitiesInCell = clusters[gridKey];
 
       if(facilitiesInCell.length >= clusterThreshold && zoomLevel < 17) {
-        // 클러스터로 묶기
-        // ⭐️ 'locations' 스키마에 맞게 컬럼명 수정
+        // [클러스터 생성]
         const avgLat = facilitiesInCell.reduce((sum,f) => sum + parseFloat(f.시설위도), 0) / facilitiesInCell.length;
         const avgLng = facilitiesInCell.reduce((sum,f) => sum + parseFloat(f.시설경도), 0) / facilitiesInCell.length;
 
@@ -751,25 +752,18 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
           facility: null,
         });
       } else {
-        // 개별 마커로 표시
+        // [개별 마커 생성]
         for(const facility of facilitiesInCell){
           clusterableItems.push({
             location: {latitude: parseFloat(facility.시설위도), longitude: parseFloat(facility.시설경도)},
             isCluster: false,
             facility: {
-              시설명: facility.시설명,
-              시설유형명: facility.시설유형명,
-              시설위도: facility.시설위도,
-              시설경도: facility.시설경도,
-              시설상태값: facility.시설상태값,
-              도로명우편번호: facility.도로명우편번호,
-              주소: facility.주소,
-              시설주소2명: facility.시설주소2명,
-              시설전화번호: facility.시설전화번호,
-              시설홈페이지URL: facility.시설홈페이지URL,
-              담당자전화번호: facility.담당자전화번호,
-              실내외구분명: facility.실내외구분명,
-              준공일자: facility.준공일자,
+              // Dart 모델(Facility.fromJson)과 키 이름을 맞춰줍니다.
+              id: facility.시설명, // ID가 따로 없으면 시설명 사용
+              name: facility.시설명,
+              // 나머지 정보들은 필요시 추가 (지금은 map_non_realtime.dart에서 쓰는 것 위주로)
+              시설유형명: facility.시설유형명, 
+              iconpath: "assets/marker.png", // 기본 아이콘 (유형별 처리는 클라이언트가 함)
             },
             count: 1,
           });
@@ -778,9 +772,9 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
     }
     res.json(clusterableItems);
 
-  }catch(err){
+  } catch(err){
     console.error(err);
-    res.status(500).json({message: '시설 로드 실패'});
+    res.status(500).json({message: '시설 로드 실패', error: err.toString()});
   }
 });
 
