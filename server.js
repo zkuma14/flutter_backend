@@ -690,6 +690,7 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
   try{
     // ⭐️ [수정] 쉼표(,) 오타를 완벽하게 제거한 쿼리
     // "준공일자" 뒤에 쉼표가 없어야 합니다!
+    console.log("=== [DEBUG] 콤마 삭제한 버전 실행 중 ===");
     const sql = `
       SELECT "시설명", "시설유형명", "시설위도", "시설경도",
       "시설상태값", "도로명우편번호", "주소", "시설주소2명",
