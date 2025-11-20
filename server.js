@@ -1,4 +1,4 @@
-// server.js (⭐️ Google 인증 + DB 트랜잭션 + Real API 융합본)
+// server.js ⭐️ Google 인증 + DB 트랜잭션 + Real API 융합본)
 // (DB 스키마가 서버 코드에 맞춰져 있다고 가정하고, snake_case 통신 문제를 수정한 버전)
 
 const express = require('express');
