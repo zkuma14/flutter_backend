@@ -158,27 +158,25 @@ app.get('/posts', authenticateToken, async (req, res) => {
     // 2. locations 테이블 조인: 위치 이름(location_name)
     // 3. 서브쿼리: 현재 참여 인원 수 계산 (current_players)
     const query = `
-      SELECT 
-        p.id,
-        p.exercise_type,
-        p.title,
-        p.content,
-        p.max_players,
-        p.view_count,
-        p.chat_room_id,
-        p.exercise_datetime,
-        p.location_id,
-        l.name AS location_name,
-        u.display_name AS author_name,
-        u.profile_image,
+    SELECT 
+      p.id,
+      p.exercise_type,
+      p.title,
+      p.content,
+      p.max_players,
+      p.view_count,
+      p.chat_room_id,
+      p.exercise_datetime,
+      p.location_id,
+      '위치 정보 없음' AS location_name, -- ✅ 임시로 고정 문자열 반환
+      u.display_name AS author_name,
+      u.profile_image,
         (SELECT COUNT(*)::int FROM post_members pm WHERE pm.post_id = p.id) AS current_players
-      FROM posts p
-      JOIN users u ON p.user_id = u.id
-      LEFT JOIN locations l ON p.location_id = l.id
-      ORDER BY p.exercise_datetime ASC; 
-    `;
-    // 날짜순 정렬 (가장 임박한 운동이 위로 오게 하려면 ASC, 최신글 위주는 create_at DESC)
-
+    FROM posts p
+    JOIN users u ON p.user_id = u.id
+  -- LEFT JOIN locations l ON p.location_id = l.id  <-- ✅ 조인 제거
+    ORDER BY p.exercise_datetime ASC; 
+  `;
     const result = await db.query(query);
     res.json(result.rows);
   } catch (err) {
