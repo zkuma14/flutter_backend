@@ -502,7 +502,20 @@ app.get('/posts', authenticateToken, async (req, res) => {
             SELECT 
                 p.id, p.title, p.content, p.exercise_type, p.max_players, 
                 p.status, p.exercise_datetime, p.chat_room_id,
-                u.display_name AS author_name,
+                
+                -- ⭐️ [수정] 여기가 핵심입니다! 
+                -- is_anonymous가 true면 '익명'을, 아니면 본명을 author_name으로 줍니다.
+                CASE 
+                    WHEN p.is_anonymous = TRUE THEN '익명'
+                    ELSE u.display_name 
+                END AS author_name,
+
+                -- (선택) 프로필 이미지도 익명이면 숨길까요? 필요하면 아래처럼 처리하세요.
+                CASE 
+                    WHEN p.is_anonymous = TRUE THEN NULL 
+                    ELSE u.profile_image 
+                END AS profile_image,
+
                 l.location_name,
                 (SELECT COUNT(*) FROM post_members pm WHERE pm.post_id = p.id) AS current_players
             FROM posts p
@@ -515,7 +528,7 @@ app.get('/posts', authenticateToken, async (req, res) => {
         res.json(result.rows);
     } catch (err) {
         console.error(err);
-        res.status(500).json({ message: '게시물 로드 실패. DB 스키마(posts, locations, post_members)를 확인하세요.' });
+        res.status(500).json({ message: '게시물 로드 실패' });
     }
 });
 
