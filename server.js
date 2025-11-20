@@ -806,52 +806,71 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
 });
 
 // ---------------------------------
-// ⚡️ 8. WebSocket 서버 설정
+// ⚡️ 8. WebSocket 서버 설정 (⭐️ Heartbeat 추가)
 // ---------------------------------
 const server = http.createServer(app); 
 const wss = new WebSocket.Server({ server });
 const clients = {}; 
 
+// ⭐️ 연결 유지(Heartbeat) 설정
+function heartbeat() {
+  this.isAlive = true;
+}
+
 wss.on('connection', (ws, req) => {
   const token = req.url.split('token=')[1];
-  if (!token) {
-    return ws.close(1008, '토큰이 필요합니다.');
-  }
+  if (!token) return ws.close(1008, '토큰 없음');
 
   let userId;
   try {
     const payload = jwt.verify(token, JWT_SECRET); 
     userId = payload.userId.toString(); 
+    
     clients[userId] = ws; 
+    ws.isAlive = true; // ⭐️ 초기 생존 확인
+    ws.on('pong', heartbeat); // ⭐️ 퐁 응답 시 생존 확인
+
     console.log(`[WS] 클라이언트 연결됨: ${userId}`);
   } catch (err) {
     return ws.close(1008, '유효하지 않은 토큰');
   }
 
-  ws.on('message', (message) => {
-    console.log(`[WS] 수신: ${message}`);
-  });
-
   ws.on('close', () => {
-    delete clients[userId]; 
+    if (userId) delete clients[userId]; 
     console.log(`[WS] 클라이언트 연결 끊김: ${userId}`);
   });
 });
 
+// ⭐️ 30초마다 연결 확인 (죽은 연결 정리)
+const interval = setInterval(function ping() {
+  wss.clients.forEach(function each(ws) {
+    if (ws.isAlive === false) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping(); // 클라이언트에게 'ping' 전송
+  });
+}, 30000);
+
+wss.on('close', function close() {
+  clearInterval(interval);
+});
+
 // ---------------------------------
-// ⭐️ 9. [핵심] WebSocket 브로드캐스트 (⭐️ 1-Query 최적화 - File 1)
+// ⭐️ 9. [핵심] WebSocket 브로드캐스트 (닉네임 포함 전송)
 // ---------------------------------
 async function broadcastMessage(roomId, message) {
   try {
-    // 1. ⭐️ 이 방에 속한 모든 참가자의 '최신' 채팅방 정보를 '한 번에' 조회 (File 1 방식)
+    // 1. ⭐️ 보낸 사람의 채팅방 내 이름(chat_name) 가져오기 (익명1, 글쓴이 등)
+    const senderQuery = await db.query(
+      `SELECT chat_name FROM participants WHERE chat_room_id = $1 AND user_id = $2`,
+      [roomId, message.sender_id]
+    );
+    const senderName = senderQuery.rows.length > 0 ? senderQuery.rows[0].chat_name : '알 수 없음';
+
+    // 2. 수신자 정보 조회
     const roomQuery = `
       SELECT 
-        cr.id, 
-        cr.last_message, 
-        cr.last_message_timestamp,
-        p.user_id, -- ⭐️ 이벤트를 받을 사용자 ID
-        p.unread_count AS "my_unread_count",
-        p.left_at,
+        cr.id, cr.last_message, cr.last_message_timestamp,
+        p.user_id, p.unread_count AS "my_unread_count", p.left_at,
         CASE 
           WHEN cr.room_name IS NULL THEN 
             (SELECT u.display_name FROM participants p_inner 
@@ -866,7 +885,7 @@ async function broadcastMessage(roomId, message) {
     
     const result = await db.query(roomQuery, [roomId]);
     
-    // 2. ⭐️ 'Message' 모델에 맞는 JSON 생성 (모든 수신자 공통)
+    // 3. ⭐️ 메시지 페이로드에 'chat_name' 포함
     const messagePayload = JSON.stringify({
       type: 'newMessage', 
       payload: {
@@ -875,21 +894,19 @@ async function broadcastMessage(roomId, message) {
         sender_id: message.sender_id,
         text: message.text,
         created_at: message.created_at,
-        unread_count: result.rows.filter(r => r.user_id.toString() !== message.sender_id.toString()).length, 
+        unread_count: result.rows.filter(r => r.user_id.toString() !== message.sender_id.toString()).length,
+        chat_name: senderName, // ⭐️ 여기가 핵심! 실시간 메시지에도 이름표 부착
       }
     });
 
-    // 3. ⭐️ 현재 접속 중인 유저에게 *각자*에 맞는 이벤트 전송
+    // 4. 전송
     for (const roomData of result.rows) {
       const uid = roomData.user_id.toString(); 
       const ws = clients[uid];
 
       if (ws && ws.readyState === WebSocket.OPEN) {
-        
-        // ⭐️ 이벤트 1: 새 메시지 전송 (ChatScreen용)
         ws.send(messagePayload);
         
-        // ⭐️ 이벤트 2: 채팅방 목록 갱신 전송 (ChatListPage용)
         const roomUpdatePayload = JSON.stringify({
           type: 'roomUpdate',
           payload: {
