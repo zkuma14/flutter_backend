@@ -779,7 +779,7 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
       SELECT "시설명", "시설유형명", "시설위도", "시설경도",
       "시설상태값", "도로명우편번호", "주소", "시설주소2명",
       "시설전화번호", "시설홈페이지URL", "담당자전화번호", "실내외구분명",
-      "준공일자" 
+      "준공일자", "firstSports", "secondSports" 
       FROM facilities_for_map 
       WHERE ST_Contains(
         ST_MakeEnvelope($1, $2, $3, $4, 4326), 
@@ -856,6 +856,8 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
               담당자전화번호: facility.담당자전화번호,
               실내외구분명: facility.실내외구분명,
               준공일자: facility.준공일자,
+              firstSports : facility.firstSports,
+              secondSports: facility.secondSports,
             },
             count: 1,
           });
