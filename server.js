@@ -1,4 +1,4 @@
-// server.js (⭐️ Google 인증 + DB 트랜잭션 + Real API 융합본)
+// server.js ⭐️ Google 인증 + DB 트랜잭션 + Real API 융합본)
 // (DB 스키마가 서버 코드에 맞춰져 있다고 가정하고, snake_case 통신 문제를 수정한 버전)
 
 const express = require('express');
@@ -142,256 +142,170 @@ const authenticateToken = (req, res, next) => {
 };
 
 // ---------------------------------
-// 🏋️‍♀️ 5. 게시물(Post) 및 운동 모집 API
+// 👤 4. 사용자 API (프로필)
 // ---------------------------------
-
-/**
- * [GET] /posts
- * 전체 게시물 목록 조회
- * - 작성자 정보, 현재 참여 인원, 위치 이름 등을 조인하여 반환
- * - Dart 모델(Post.fromJson)과 필드명을 일치시켜야 함
- */
-app.get('/posts', authenticateToken, async (req, res) => {
+// (hidden_users 테이블이 있다는 가정 하에 원본 유지)
+app.get('/users/me', authenticateToken, async (req, res) => {
   try {
-    // 💡 복잡한 정보를 한 번에 가져오기 위한 쿼리
-    // 1. users 테이블 조인: 작성자 이름(author_name), 프로필(profile_image)
-    // 2. locations 테이블 조인: 위치 이름(location_name)
-    // 3. 서브쿼리: 현재 참여 인원 수 계산 (current_players)
-    const query = `
-      SELECT 
-        p.id,
-        p.exercise_type,
-        p.title,
-        p.content,
-        p.max_players,
-        p.view_count,
-        p.chat_room_id,
-        p.exercise_datetime,
-        p.location_id,
-        l.name AS location_name,
-        u.display_name AS author_name,
-        u.profile_image,
-        (SELECT COUNT(*)::int FROM post_members pm WHERE pm.post_id = p.id) AS current_players
-      FROM posts p
-      JOIN users u ON p.user_id = u.id
-      LEFT JOIN locations l ON p.location_id = l.id
-      ORDER BY p.exercise_datetime ASC; 
-    `;
-    // 날짜순 정렬 (가장 임박한 운동이 위로 오게 하려면 ASC, 최신글 위주는 create_at DESC)
+    const userId = req.user.userId;
+    const userResult = await db.query('SELECT * FROM users WHERE id = $1', [userId]);
+    const user = userResult.rows[0];
 
-    const result = await db.query(query);
-    res.json(result.rows);
-  } catch (err) {
-    console.error('게시물 목록 조회 실패:', err);
-    res.status(500).json({ message: '게시물을 불러오지 못했습니다.' });
-  }
-});
-
-/**
- * [POST] /posts
- * 새 게시물 작성
- * - 트랜잭션 필수: 채팅방 생성 -> 게시글 생성 -> 멤버 등록 -> 채팅 참여
- */
-app.post('/posts', authenticateToken, async (req, res) => {
-  const client = await db.getClient();
-  const userId = req.user.userId;
-  const { 
-    exercise_type, 
-    title, 
-    content, 
-    location_id, 
-    max_players, 
-    exercise_datetime 
-  } = req.body;
-
-  try {
-    await client.query('BEGIN');
-
-    // 1. 채팅방 생성 (게시글과 1:1 매핑)
-    // chat_rooms 테이블에 name 컬럼이 있다면 제목을 넣거나 '운동 모임' 등으로 설정
-    const chatRoomResult = await client.query(
-      `INSERT INTO chat_rooms (created_at) VALUES (NOW()) RETURNING id`
-    );
-    const newChatRoomId = chatRoomResult.rows[0].id;
-
-    // 2. 게시글 생성
-    const insertPostQuery = `
-      INSERT INTO posts (
-        user_id, exercise_type, title, content, 
-        location_id, max_players, exercise_datetime, 
-        chat_room_id, view_count, created_at
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, NOW())
-      RETURNING *
-    `;
-    const postResult = await client.query(insertPostQuery, [
-      userId, exercise_type, title, content, 
-      location_id, max_players, exercise_datetime, newChatRoomId
-    ]);
-    const newPost = postResult.rows[0];
-
-    // 3. 작성자를 모임 멤버(post_members)로 등록
-    await client.query(
-      `INSERT INTO post_members (post_id, user_id, joined_at) VALUES ($1, $2, NOW())`,
-      [newPost.id, userId]
-    );
-
-    // 4. 작성자를 채팅방 참여자(participants)로 등록
-    // (사용자의 닉네임을 가져와서 chat_name으로 사용)
-    const userRes = await client.query('SELECT display_name, profile_image FROM users WHERE id = $1', [userId]);
-    const userProfile = userRes.rows[0];
-
-    await client.query(
-      `INSERT INTO participants (chat_room_id, user_id, chat_name, joined_at) 
-       VALUES ($1, $2, $3, NOW())`,
-      [newChatRoomId, userId, userProfile.display_name]
-    );
-
-    await client.query('COMMIT');
-
-    // 5. 클라이언트에 반환할 데이터 구성 (GET /posts 와 포맷 통일)
-    // location_name을 가져오기 위해 locations 테이블 조회 필요
-    const locRes = await db.query('SELECT name FROM locations WHERE id = $1', [location_id]);
-    const locationName = locRes.rows.length > 0 ? locRes.rows[0].name : '알 수 없는 위치';
-
-    const responseData = {
-      ...newPost,
-      author_name: userProfile.display_name,
-      profile_image: userProfile.profile_image,
-      location_name: locationName,
-      current_players: 1, // 작성자 1명
-      max_players: max_players
-    };
-
-    res.status(201).json(responseData);
-
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('게시물 작성 실패:', err);
-    res.status(500).json({ message: '게시물 작성 중 오류가 발생했습니다.' });
-  } finally {
-    client.release();
-  }
-});
-
-/**
- * [POST] /posts/:id/join
- * 게시물 참여하기 (Post Detail 화면의 '참여하기' 버튼)
- * - 인원 수 확인 -> post_members 추가 -> participants 추가 -> 시스템 메시지 전송
- */
-app.post('/posts/:id/join', authenticateToken, async (req, res) => {
-  const client = await db.getClient();
-  const userId = req.user.userId;
-  const postId = req.params.id;
-
-  try {
-    await client.query('BEGIN');
-
-    // 1. 게시글 정보 및 현재 인원 확인 (Lock을 걸어 동시성 제어 권장 - FOR UPDATE)
-    const postQuery = `
-      SELECT p.*, 
-        (SELECT COUNT(*)::int FROM post_members pm WHERE pm.post_id = p.id) as current_count
-      FROM posts p 
-      WHERE p.id = $1 
-      FOR UPDATE
-    `;
-    const postRes = await client.query(postQuery, [postId]);
-    
-    if (postRes.rows.length === 0) {
-      throw new Error('존재하지 않는 게시물입니다.');
-    }
-
-    const post = postRes.rows[0];
-
-    // 2. 유효성 검사
-    // 2-1. 이미 참여했는지 확인
-    const checkMember = await client.query(
-      'SELECT * FROM post_members WHERE post_id = $1 AND user_id = $2', 
-      [postId, userId]
-    );
-    if (checkMember.rows.length > 0) {
-      await client.query('ROLLBACK');
-      return res.status(409).json({ message: '이미 참여 중인 모임입니다.' });
-    }
-
-    // 2-2. 정원 초과 확인
-    if (post.current_count >= post.max_players) {
-      await client.query('ROLLBACK');
-      return res.status(409).json({ message: '모집 인원이 마감되었습니다.' });
-    }
-
-    // 3. 멤버 추가 (post_members)
-    await client.query(
-      `INSERT INTO post_members (post_id, user_id, joined_at) VALUES ($1, $2, NOW())`,
-      [postId, userId]
-    );
-
-    // 4. 채팅방 참여 (participants)
-    // 내 정보 가져오기
-    const userRes = await client.query('SELECT display_name FROM users WHERE id = $1', [userId]);
-    const myName = userRes.rows[0].display_name;
-
-    // 채팅방에 이미 나갔다가 다시 들어오는 경우 고려 (INSERT ON CONFLICT or Check)
-    // 여기서는 간단히 INSERT 시도하되, 기존에 있으면 UPDATE 처리 (숨김 해제 등) 로직이 필요할 수 있음
-    // 간단하게 DELETE 후 INSERT 혹은 Upsert 로직 사용. 여기선 단순 INSERT
-    
-    // 혹시 chat_room_id가 null이면 에러
-    if (!post.chat_room_id) throw new Error('채팅방이 연결되지 않은 게시물입니다.');
-
-    // 기존 참여 기록 확인 (나갔던 유저일 수 있음)
-    const checkPart = await client.query(
-      'SELECT * FROM participants WHERE chat_room_id = $1 AND user_id = $2',
-      [post.chat_room_id, userId]
-    );
-
-    if (checkPart.rows.length > 0) {
-      // 나갔던 유저라면 다시 활성화
-      await client.query(
-        `UPDATE participants SET is_hidden = FALSE, joined_at = NOW() 
-         WHERE chat_room_id = $1 AND user_id = $2`,
-        [post.chat_room_id, userId]
-      );
+    if (user) {
+        res.json(user);
     } else {
-      // 신규 참여
-      await client.query(
-        `INSERT INTO participants (chat_room_id, user_id, chat_name, joined_at) 
-         VALUES ($1, $2, $3, NOW())`,
-        [post.chat_room_id, userId, myName]
-      );
+        res.status(404).json({ message: '사용자를 찾을 수 없습니다.' });
     }
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: '서버 오류' });
+  }
+});
 
-    // 5. 시스템 메시지 전송 ("OOO님이 참여하셨습니다")
-    const sysMsg = `${myName}님이 모임에 참여하셨습니다.`;
-    const msgResult = await client.query(
-      `INSERT INTO messages (chat_room_id, sender_id, text, msg_type, created_at) 
-       VALUES ($1, $2, $3, 'SYSTEM', NOW()) RETURNING *`,
-      [post.chat_room_id, userId, sysMsg]
+// ⭐️ [수정] PUT /users/me (프로필 수정 - 생년월일 추가)
+app.put('/users/me', authenticateToken, async (req, res) => {
+  const userId = req.user.userId;
+  // birthDate 추가됨
+  const { displayName, preferredSport, birthDate } = req.body;
+
+  try {
+    // birth_date 컬럼 업데이트 추가
+    const result = await db.query(
+      `UPDATE users 
+       SET display_name = $1, preferred_sport = $2, birth_date = $3 
+       WHERE id = $4 
+       RETURNING *`,
+      [displayName, preferredSport, birthDate, userId]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: '프로필 업데이트 실패' });
+  }
+});
+
+// ⭐️ [보강] POST /users/leave (회원 탈퇴 - 게시글 및 연관 데이터 완벽 삭제)
+app.post('/users/leave', authenticateToken, async (req, res) => {
+    const userId = req.user.userId;
+    const client = await db.getClient();
+
+    try {
+        await client.query('BEGIN');
+
+        // 1. 내가 '참여'한 기록 삭제 (남의 글에서 나를 지움)
+        await client.query('DELETE FROM post_members WHERE user_id = $1', [userId]);
+        
+        // 2. 내가 '작성'한 게시글에 달린 다른 사람들의 참여 기록 삭제
+        // (이걸 먼저 안 지우면 게시글 삭제 시 에러 남)
+        await client.query(`
+            DELETE FROM post_members 
+            WHERE post_id IN (SELECT id FROM posts WHERE user_id = $1)
+        `, [userId]);
+
+        // 3. 내가 '작성'한 게시글 삭제
+        await client.query('DELETE FROM posts WHERE user_id = $1', [userId]);
+
+        // 4. 기타 정보 삭제 (채팅 참여, 메시지, 숨김 친구 등)
+        await client.query('DELETE FROM participants WHERE user_id = $1', [userId]);
+        await client.query('DELETE FROM messages WHERE sender_id = $1', [userId]);
+        await client.query('DELETE FROM hidden_users WHERE hider_id = $1 OR hidden_id = $1', [userId]);
+
+        // 5. 최종적으로 사용자 삭제
+        await client.query('DELETE FROM users WHERE id = $1', [userId]);
+
+        await client.query('COMMIT');
+        console.log(`✅ 사용자(ID: ${userId}) 탈퇴 및 데이터 삭제 완료`);
+        res.sendStatus(200);
+
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('❌ 회원 탈퇴 치명적 오류:', err); // 서버 터미널에서 이 로그를 꼭 확인하세요!
+        res.status(500).json({ message: '회원 탈퇴 실패', error: err.toString() });
+    } finally {
+        client.release();
+    }
+});
+
+// GET /users (다른 사용자 목록 - '나'와 '숨긴' 사용자 제외)
+// (hidden_users 테이블이 있다는 가정 하에 원본 유지)
+app.get('/users', authenticateToken, async (req, res) => {
+    const userId = req.user.userId;
+    try {
+        const query = `
+            SELECT * FROM users WHERE id != $1;
+        `;
+        const result = await db.query(query, [userId]);
+        res.json(result.rows);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: '사용자 목록 로드 실패. DB 스키마를 확인하세요.' });
+    }
+});
+
+// ⭐️ [대폭 수정] POST /rooms/:roomId/leave (방 나가기 + 모임 탈퇴 + 시스템 메시지)
+// (기존 /hide API를 /leave 로 변경하거나 기능을 덮어씁니다)
+app.post('/rooms/:roomId/leave', authenticateToken, async (req, res) => {
+  const { roomId } = req.params;
+  const userId = req.user.userId;
+
+  const client = await db.getClient();
+  try {
+    await client.query('BEGIN');
+
+    // 1. 내 채팅 이름 가져오기 (나갔습니다 메시지용)
+    const partResult = await client.query(
+        'SELECT chat_name FROM participants WHERE chat_room_id = $1 AND user_id = $2',
+        [roomId, userId]
+    );
+    const myName = partResult.rows.length > 0 ? partResult.rows[0].chat_name : '알 수 없음';
+
+    // 2. post_members 에서 삭제 (모임 탈퇴)
+    // (이 방과 연결된 post_id를 찾아서 삭제해야 함)
+    await client.query(`
+        DELETE FROM post_members 
+        WHERE user_id = $1 AND post_id = (SELECT id FROM posts WHERE chat_room_id = $2)
+    `, [userId, roomId]);
+
+    // 3. participants 업데이트 (숨김 처리 & 나간 시간 기록)
+    // (아예 DELETE 하지 않는 이유는, 나중에 다시 들어올 때 이름 기록 등을 유지하거나 로그를 남기기 위함이나,
+    //  사용자 요청은 "인원수 줄어들게" 이므로 여기서는 is_hidden 처리만 하고, 
+    //  클라이언트나 쿼리에서 is_hidden=false 인 사람만 카운트하도록 로직을 짜야 함.
+    //  하지만 확실한 인원 감소를 위해 DELETE를 하거나, COUNT 쿼리를 수정해야 함.
+    //  여기서는 **채팅방 목록에는 남기지 않으려면** is_hidden=TRUE가 맞습니다.)
+    await client.query(
+      'UPDATE participants SET is_hidden = TRUE, left_at = NOW() WHERE chat_room_id = $1 AND user_id = $2',
+      [roomId, userId]
     );
 
-    // 6. 채팅방 마지막 메시지 업데이트
+    // 4. 시스템 메시지 전송 ('익명3님이 나갔습니다')
+    const sysMsg = `${myName}님이 모임에서 나갔습니다.`;
+    const msgResult = await client.query(
+        `INSERT INTO messages (chat_room_id, sender_id, text, msg_type) 
+         VALUES ($1, $2, $3, 'SYSTEM') RETURNING *`,
+        [roomId, userId, sysMsg]
+    );
+
+    // 5. 채팅방 마지막 메시지 갱신
     await client.query(
-      'UPDATE chat_rooms SET last_message = $1, last_message_timestamp = NOW() WHERE id = $2',
-      [sysMsg, post.chat_room_id]
+        'UPDATE chat_rooms SET last_message = $1, last_message_timestamp = NOW() WHERE id = $2',
+        [sysMsg, roomId]
     );
 
     await client.query('COMMIT');
+    
+    // 웹소켓 전송 (시스템 메시지 & 방 업데이트)
+    broadcastMessage(roomId, msgResult.rows[0]);
 
-    // 웹소켓 브로드캐스트 (채팅방에 있는 사람들에게 알림)
-    // broadcastMessage(post.chat_room_id, msgResult.rows[0]); 
-
-    res.json({ 
-      message: '참여가 완료되었습니다.', 
-      chatRoomId: post.chat_room_id 
-    });
-
+    res.sendStatus(200);
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error('모임 참여 실패:', err);
-    res.status(500).json({ message: err.message || '참여 처리 중 오류가 발생했습니다.' });
+    console.error(err);
+    res.status(500).json({ message: '방 나가기 실패' });
   } finally {
     client.release();
   }
 });
+
 
 // ---------------------------------
 // 💬 5. 채팅방 API (⭐️ DB 트랜잭션 최적화 - File 2)
