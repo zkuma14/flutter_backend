@@ -430,70 +430,125 @@ app.get('/rooms/:roomId/messages', authenticateToken, async (req, res) => {
     }
 });
 
-// POST /rooms/:roomId/messages (메시지 전송 - ⭐️ File 2 트랜잭션)
+// ⭐️ [수정] POST /rooms/:roomId/messages (메시지 전송 + 안읽음 수 저장)
 app.post('/rooms/:roomId/messages', authenticateToken, async (req, res) => {
   const { text } = req.body;
   const { roomId } = req.params;
   const senderId = req.user.userId;
 
-  const client = await db.getClient(); // ⭐️ File 2
+  const client = await db.getClient();
   try {
-    await client.query('BEGIN'); // ⭐️ File 2
+    await client.query('BEGIN');
 
-    // 1. messages 테이블에 메시지 삽입
-    const messageResult = await client.query( // ⭐️ File 2
-      'INSERT INTO messages (chat_room_id, sender_id, text) VALUES ($1, $2, $3) RETURNING *',
-      [roomId, senderId, text]
+    // 1. 채팅방 인원수 확인 (나 빼고 몇 명인지)
+    const countRes = await client.query(
+        'SELECT COUNT(*) FROM participants WHERE chat_room_id = $1',
+        [roomId]
+    );
+    // 전체 인원 - 1(나) = 안 읽은 사람 수
+    // (만약 상대방이 현재 접속중이라도 일단 DB에는 카운트를 넣고, 클라이언트가 읽음 처리 API를 호출하며 깎습니다)
+    let initialUnreadCount = parseInt(countRes.rows[0].count) - 1;
+    if (initialUnreadCount < 0) initialUnreadCount = 0;
+
+    // 2. messages 테이블에 저장 (unread_count 포함!)
+    const messageResult = await client.query(
+      `INSERT INTO messages (chat_room_id, sender_id, text, msg_type, unread_count) 
+       VALUES ($1, $2, $3, 'TEXT', $4) 
+       RETURNING *`,
+      [roomId, senderId, text, initialUnreadCount]
     );
     const newMessage = messageResult.rows[0];
 
-    // 2. chat_rooms 테이블의 마지막 메시지 업데이트
-    await client.query( // ⭐️ File 2
+    // 3. 채팅방 갱신
+    await client.query(
       'UPDATE chat_rooms SET last_message = $1, last_message_timestamp = $2 WHERE id = $3',
       [text, newMessage.created_at, roomId]
     );
 
-    // 3. participants 테이블의 안읽음 카운트 업데이트
-    await client.query( // ⭐️ File 2
+    // 4. 안읽음 카운트 증가 (participants 테이블)
+    // 내가 아닌 사람들의 unread_count를 +1
+    await client.query(
       `UPDATE participants SET 
-         unread_count = CASE 
-           WHEN user_id = $1 THEN 0 
-           ELSE unread_count + 1 
-         END,
+         unread_count = unread_count + 1,
          is_hidden = FALSE, 
          left_at = NULL     
-       WHERE chat_room_id = $2`,
-      [senderId, roomId]
+       WHERE chat_room_id = $1 AND user_id != $2`,
+      [roomId, senderId]
     );
     
-    await client.query('COMMIT'); // ⭐️ File 2
+    await client.query('COMMIT');
 
-    // (핵심) WebSocket으로 이 방에 연결된 모든 클라이언트에게 새 메시지 전송
+    // 5. 전송
     broadcastMessage(roomId, newMessage);
 
     res.status(201).json(newMessage);
   } catch (err) {
-    await client.query('ROLLBACK'); // ⭐️ File 2
+    await client.query('ROLLBACK');
     console.error(err);
     res.status(500).json({ message: '메시지 전송 오류' });
   } finally {
-    client.release(); // ⭐️ File 2
+    client.release();
   }
 });
 
-// POST /rooms/:roomId/read (안읽음 0 처리 API)
+// ⭐️ [수정] POST /rooms/:roomId/read (읽음 처리 + 숫자 깎기 + 알림 방송)
 app.post('/rooms/:roomId/read', authenticateToken, async (req, res) => {
   const { roomId } = req.params;
   const userId = req.user.userId;
+
+  const client = await db.getClient();
   try {
-    await db.query(
+    await client.query('BEGIN');
+
+    // 1. 내가 안 읽은 메시지가 있는지 확인 (내 unread_count 확인)
+    const myStatus = await client.query(
+        'SELECT unread_count FROM participants WHERE chat_room_id = $1 AND user_id = $2',
+        [roomId, userId]
+    );
+
+    // 내가 읽을 게 있었다면 -> 메시지들의 카운트를 깎는다.
+    if (myStatus.rows.length > 0 && myStatus.rows[0].unread_count > 0) {
+        // 이 방의 모든 메시지 중, 안읽음 숫자가 0보다 큰 것들을 -1 해줌
+        // (정교하게 하려면 내가 안 읽은 시점 이후것만 해야 하지만, "입장=모두읽음" 룰 적용)
+        await client.query(
+            `UPDATE messages 
+             SET unread_count = unread_count - 1 
+             WHERE chat_room_id = $1 AND unread_count > 0`,
+            [roomId]
+        );
+    }
+
+    // 2. 내 상태를 '모두 읽음(0)'으로 변경
+    await client.query(
       'UPDATE participants SET unread_count = 0 WHERE chat_room_id = $1 AND user_id = $2',
       [roomId, userId]
     );
+
+    await client.query('COMMIT');
+
+    // ⭐️ 3. [핵심] "누군가 읽었습니다"라고 방 사람들에게 방송
+    // (이걸 받아야 상대방 폰에서 숫자가 줄어듭니다)
+    const readPayload = JSON.stringify({
+        type: 'roomRead',
+        payload: { chatRoomId: roomId }
+    });
+
+    // 접속 중인 방 멤버들에게 전송
+    const members = await db.query('SELECT user_id FROM participants WHERE chat_room_id = $1', [roomId]);
+    for (const m of members.rows) {
+        const ws = clients[m.user_id];
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(readPayload);
+        }
+    }
+
     res.sendStatus(200);
   } catch (err) {
+    await client.query('ROLLBACK');
     console.error(err);
     res.status(500).json({ message: '읽음 처리 실패' });
+  } finally {
+    client.release();
   }
 });
 
