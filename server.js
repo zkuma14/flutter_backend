@@ -729,7 +729,7 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
   try{
     // ⭐️ [수정] 쉼표(,) 오타를 완벽하게 제거한 쿼리
     // "준공일자" 뒤에 쉼표가 없어야 합니다!
-    console.log("=== [DEBUG] 콤마 삭제한 버전 실행 중 ===");
+    console.log("===============쉿 섹스중================");
     const sql = `
       SELECT "시설명", "시설유형명", "시설위도", "시설경도",
       "시설상태값", "도로명우편번호", "주소", "시설주소2명",
@@ -824,6 +824,27 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
   } catch(err){
     console.error(err);
     res.status(500).json({message: '시설 로드 실패', error: err.toString()});
+  }
+});
+
+//----------------------
+//운동 카테고리 API
+//----------------------
+
+app.get('/sports/categories', authenticateToken, async(req,res)=>{
+  try{
+    const sql = `
+    SELECT category, json_agg(sport_name ORDER BY sport_name) as sports
+    FROM sport_mapping
+    GROUP BY category
+    ORDER BY category;
+  `;
+
+  const resule = await db.query(sql);
+  res.json(result.rows);
+  }catch(err){
+    console.error('[EROOR] /sports/categories 오류:',err);
+    res.status(500).json({message: '카테고리 로드 실패'});
   }
 });
 
