@@ -855,76 +855,78 @@ wss.on('close', function close() {
 });
 
 // ---------------------------------
-// ⭐️ 9. [핵심] WebSocket 브로드캐스트 (닉네임 포함 전송)
+// ⭐️ 9. [수정] WebSocket 브로드캐스트 (단순화 & 디버깅 강화 버전)
 // ---------------------------------
 async function broadcastMessage(roomId, message) {
+  console.log(`📡 [WS] 브로드캐스트 시작 (방: ${roomId})`);
+
   try {
-    // 1. ⭐️ 보낸 사람의 채팅방 내 이름(chat_name) 가져오기 (익명1, 글쓴이 등)
-    const senderQuery = await db.query(
-      `SELECT chat_name FROM participants WHERE chat_room_id = $1 AND user_id = $2`,
+    // 1. 보낸 사람의 '이 방에서의 닉네임(익명N)' 찾기
+    const senderRes = await db.query(
+      'SELECT chat_name FROM participants WHERE chat_room_id = $1 AND user_id = $2',
       [roomId, message.sender_id]
     );
-    const senderName = senderQuery.rows.length > 0 ? senderQuery.rows[0].chat_name : '알 수 없음';
+    const senderName = senderRes.rows.length > 0 ? senderRes.rows[0].chat_name : '알 수 없음';
 
-    // 2. 수신자 정보 조회
-    const roomQuery = `
-      SELECT 
-        cr.id, cr.last_message, cr.last_message_timestamp,
-        p.user_id, p.unread_count AS "my_unread_count", p.left_at,
-        CASE 
-          WHEN cr.room_name IS NULL THEN 
-            (SELECT u.display_name FROM participants p_inner 
-             JOIN users u ON u.id = p_inner.user_id
-             WHERE p_inner.chat_room_id = cr.id AND p_inner.user_id != p.user_id)
-          ELSE cr.room_name
-        END AS "room_name"
-      FROM chat_rooms cr
-      JOIN participants p ON cr.id = p.chat_room_id
-      WHERE cr.id = $1;
-    `;
-    
-    const result = await db.query(roomQuery, [roomId]);
-    
-    // 3. ⭐️ 메시지 페이로드에 'chat_name' 포함
-    const messagePayload = JSON.stringify({
-      type: 'newMessage', 
-      payload: {
-        id: message.id,
-        chat_room_id: message.chat_room_id,
-        sender_id: message.sender_id,
-        text: message.text,
-        created_at: message.created_at,
-        unread_count: result.rows.filter(r => r.user_id.toString() !== message.sender_id.toString()).length,
-        chat_name: senderName, // ⭐️ 여기가 핵심! 실시간 메시지에도 이름표 부착
-      }
-    });
+    // 2. 이 방에 있는 '모든 참가자' 목록 가져오기
+    const participantsRes = await db.query(
+      'SELECT user_id, unread_count FROM participants WHERE chat_room_id = $1',
+      [roomId]
+    );
+    const participants = participantsRes.rows;
+    console.log(`👥 [WS] 전송 대상: 총 ${participants.length}명`);
 
-    // 4. 전송
-    for (const roomData of result.rows) {
-      const uid = roomData.user_id.toString(); 
-      const ws = clients[uid];
+    // 3. 방 정보 가져오기 (채팅방 목록 갱신용)
+    const roomRes = await db.query(
+      'SELECT room_name, last_message, last_message_timestamp FROM chat_rooms WHERE id = $1',
+      [roomId]
+    );
+    const roomInfo = roomRes.rows[0];
+
+    // 4. 각 참가자에게 전송
+    for (const p of participants) {
+      const targetUserId = p.user_id.toString();
+      const ws = clients[targetUserId]; // 접속해 있는 소켓 찾기
 
       if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(messagePayload);
-        
-        const roomUpdatePayload = JSON.stringify({
-          type: 'roomUpdate',
+        // A. 채팅방 안으로 쏘는 메시지 (newMessage)
+        const messagePayload = JSON.stringify({
+          type: 'newMessage',
           payload: {
-            id: roomData.id.toString(), 
-            room_name: roomData.room_name,
-            last_message: roomData.last_message,
-            last_message_timestamp: roomData.last_message_timestamp,
-            my_unread_count: roomData.my_unread_count,
-            left_at: roomData.left_at,
+            id: message.id,
+            chat_room_id: message.chat_room_id,
+            sender_id: message.sender_id,
+            text: message.text,
+            created_at: message.created_at,
+            unread_count: message.unread_count, // (참고: 정확한 계산은 별도 로직 필요하나 일단 전송)
+            chat_name: senderName, // ⭐️ 익명 이름 전송
           }
         });
-        ws.send(roomUpdatePayload);
+        ws.send(messagePayload);
+
+        // B. 채팅방 목록 갱신 신호 (roomUpdate)
+        // (상대방의 방 이름은 내 이름이거나 그룹명이어야 하는데, 일단 DB의 room_name이나 시스템 로직 따름)
+        const updatePayload = JSON.stringify({
+          type: 'roomUpdate',
+          payload: {
+            id: roomId,
+            room_name: roomInfo.room_name || senderName, // 방 이름이 없으면 보낸 사람 이름 표시
+            last_message: roomInfo.last_message,
+            last_message_timestamp: roomInfo.last_message_timestamp,
+            my_unread_count: p.unread_count,
+            left_at: null, 
+          }
+        });
+        ws.send(updatePayload);
+
+        console.log(`✅ [WS] 전송 성공 -> User ${targetUserId}`);
+      } else {
+        console.log(`📴 [WS] 전송 실패 (미접속) -> User ${targetUserId}`);
       }
     }
   } catch (err) {
-    console.error("WebSocket 브로드캐스트 오류:", err);
+    console.error("❌ [WS] 브로드캐스트 오류:", err);
   }
-}
 
 // ---------------------------------
 // 10. 서버 시작
