@@ -386,50 +386,41 @@ app.get('/rooms/:roomId/messages', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const { leftAt } = req.query; 
 
-    console.log(`\n🔍 [DEBUG] 메시지 로드 요청 시작`);
-    console.log(`- 방 ID: ${roomId}`);
-    console.log(`- 유저 ID: ${userId}`);
-    console.log(`- leftAt 값: ${leftAt} (타입: ${typeof leftAt})`);
+    console.log(`\n🔍 [DEBUG] 메시지 로드 요청 시작 (방: ${roomId})`);
 
     try {
         // 1. 권한 체크
         const partCheck = await db.query(
-            'SELECT * FROM participants WHERE chat_room_id = $1 AND user_id = $2',
+            'SELECT 1 FROM participants WHERE chat_room_id = $1 AND user_id = $2',
             [roomId, userId]
         );
         
         if (partCheck.rows.length === 0) {
-            console.log(`❌ [DEBUG] 권한 없음: participants 테이블에 이 유저가 없음`);
             return res.status(403).json({ message: '권한이 없습니다.' });
         }
-        
-        // DB에 저장된 left_at 값 확인
-        const dbLeftAt = partCheck.rows[0].left_at;
-        console.log(`- DB상의 left_at: ${dbLeftAt}`);
 
         // 2. 쿼리 생성
+        // ⭐️ [수정됨] p.profile_image -> u.profile_image 로 변경하고 users 테이블 조인 추가
         let query = `
-            SELECT m.*, p.chat_name, p.profile_image
+            SELECT m.*, p.chat_name, u.profile_image
             FROM messages m
             LEFT JOIN participants p ON m.chat_room_id = p.chat_room_id AND m.sender_id = p.user_id
+            LEFT JOIN users u ON m.sender_id = u.id
             WHERE m.chat_room_id = $1
         `;
         const params = [roomId];
 
-        // 3. leftAt 조건 적용 여부 확인
+        // 3. leftAt 조건 적용
         if (leftAt && leftAt !== 'null' && leftAt !== 'undefined') {
-            console.log(`- ⚠️ 시간 필터 적용됨: ${leftAt} 이후의 메시지만 가져옴`);
             query += ` AND m.created_at > $2`;
             params.push(leftAt);
-        } else {
-            console.log(`- ✅ 시간 필터 없음: 모든 메시지 가져옴`);
         }
 
         query += ` ORDER BY m.created_at DESC LIMIT 100`;
 
         // 4. 실행
         const result = await db.query(query, params);
-        console.log(`✅ [DEBUG] 최종 조회된 메시지 개수: ${result.rows.length}개`);
+        console.log(`✅ [DEBUG] 메시지 ${result.rows.length}개 로드 성공`);
         
         res.json(result.rows);
 
