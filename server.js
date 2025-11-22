@@ -322,11 +322,15 @@ app.get('/rooms', authenticateToken, async (req, res) => {
         cr.last_message_timestamp,
         p.unread_count AS "my_unread_count", 
         p.left_at, 
+        
+        -- ⭐️ [추가] 채팅방 인원수 계산 (나가지 않은 사람만 카운트)
+        (SELECT COUNT(*) FROM participants p2 WHERE p2.chat_room_id = cr.id AND p2.is_hidden = FALSE)::int AS "user_count",
+
         CASE 
           WHEN cr.room_name IS NULL THEN 
             (SELECT u.display_name FROM participants p_inner 
              JOIN users u ON u.id = p_inner.user_id
-             WHERE p_inner.chat_room_id = cr.id AND p_inner.user_id != $1)
+             WHERE p_inner.chat_room_id = cr.id AND p_inner.user_id != $1 LIMIT 1)
           ELSE cr.room_name
         END AS "room_name"
       FROM chat_rooms cr
