@@ -381,24 +381,43 @@ app.post('/rooms', authenticateToken, async (req, res) => {
   }
 });
 
-// ⭐️ [수정] GET /rooms/:roomId/messages (채팅 이름(chat_name) 반환)
 app.get('/rooms/:roomId/messages', authenticateToken, async (req, res) => {
     const { roomId } = req.params;
     const userId = req.user.userId;
+    const { leftAt } = req.query; 
 
     try {
-        // ... 권한 체크 (기존 동일) ...
-
-        // 💡 조인해서 participants의 chat_name을 가져옵니다.
-        // 메시지 보낸 사람의 당시 닉네임(익명N)을 보여주기 위함
-        const result = await db.query(
-            `SELECT m.*, p.chat_name, p.profile_image
-             FROM messages m
-             LEFT JOIN participants p ON m.chat_room_id = p.chat_room_id AND m.sender_id = p.user_id
-             WHERE m.chat_room_id = $1
-             ORDER BY m.created_at ASC LIMIT 100`,
-            [roomId]
+        // 1. 권한 체크 (이 방에 참여자인지)
+        const partCheck = await db.query(
+            'SELECT 1 FROM participants WHERE chat_room_id = $1 AND user_id = $2',
+            [roomId, userId]
         );
+        if (partCheck.rows.length === 0) {
+            return res.status(403).json({ message: '권한이 없습니다.' });
+        }
+
+        // 2. 쿼리 생성 (동적 쿼리)
+        let query = `
+            SELECT m.*, p.chat_name, p.profile_image
+            FROM messages m
+            LEFT JOIN participants p ON m.chat_room_id = p.chat_room_id AND m.sender_id = p.user_id
+            WHERE m.chat_room_id = $1
+        `;
+        const params = [roomId];
+
+        // 3. leftAt 조건 추가 (나갔다가 다시 들어온 경우, 나간 시점 이후 메시지만 보여줌)
+        if (leftAt && leftAt !== 'null' && leftAt !== 'undefined') {
+            query += ` AND m.created_at > $2`;
+            params.push(leftAt);
+        }
+
+        // 4. 정렬 및 제한 (최신순 100개)
+        // Flutter ListView(reverse: true)를 쓰므로 DESC(내림차순)가 맞습니다.
+        // 화면엔 [최신 ... 과거] 순으로 오지만 reverse라서 [과거 ... 최신]으로 보입니다.
+        query += ` ORDER BY m.created_at DESC LIMIT 100`;
+
+        // 5. 실행 및 응답
+        const result = await db.query(query, params);
         res.json(result.rows);
 
     } catch (err) {
@@ -406,7 +425,6 @@ app.get('/rooms/:roomId/messages', authenticateToken, async (req, res) => {
         res.status(500).json({ message: '메시지 로드 실패' });
     }
 });
-
 
 // POST /rooms/:roomId/messages (메시지 전송 - ⭐️ File 2 트랜잭션)
 app.post('/rooms/:roomId/messages', authenticateToken, async (req, res) => {
