@@ -928,7 +928,6 @@ async function broadcastMessage(roomId, message) {
     console.error("❌ [WS] 브로드캐스트 오류:", err);
   }
 }
-
 // ---------------------------------
 // 10. 서버 시작
 // ---------------------------------
