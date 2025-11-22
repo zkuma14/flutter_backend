@@ -386,17 +386,28 @@ app.get('/rooms/:roomId/messages', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const { leftAt } = req.query; 
 
+    console.log(`\n🔍 [DEBUG] 메시지 로드 요청 시작`);
+    console.log(`- 방 ID: ${roomId}`);
+    console.log(`- 유저 ID: ${userId}`);
+    console.log(`- leftAt 값: ${leftAt} (타입: ${typeof leftAt})`);
+
     try {
-        // 1. 권한 체크 (이 방에 참여자인지)
+        // 1. 권한 체크
         const partCheck = await db.query(
-            'SELECT 1 FROM participants WHERE chat_room_id = $1 AND user_id = $2',
+            'SELECT * FROM participants WHERE chat_room_id = $1 AND user_id = $2',
             [roomId, userId]
         );
+        
         if (partCheck.rows.length === 0) {
+            console.log(`❌ [DEBUG] 권한 없음: participants 테이블에 이 유저가 없음`);
             return res.status(403).json({ message: '권한이 없습니다.' });
         }
+        
+        // DB에 저장된 left_at 값 확인
+        const dbLeftAt = partCheck.rows[0].left_at;
+        console.log(`- DB상의 left_at: ${dbLeftAt}`);
 
-        // 2. 쿼리 생성 (동적 쿼리)
+        // 2. 쿼리 생성
         let query = `
             SELECT m.*, p.chat_name, p.profile_image
             FROM messages m
@@ -405,23 +416,25 @@ app.get('/rooms/:roomId/messages', authenticateToken, async (req, res) => {
         `;
         const params = [roomId];
 
-        // 3. leftAt 조건 추가 (나갔다가 다시 들어온 경우, 나간 시점 이후 메시지만 보여줌)
+        // 3. leftAt 조건 적용 여부 확인
         if (leftAt && leftAt !== 'null' && leftAt !== 'undefined') {
+            console.log(`- ⚠️ 시간 필터 적용됨: ${leftAt} 이후의 메시지만 가져옴`);
             query += ` AND m.created_at > $2`;
             params.push(leftAt);
+        } else {
+            console.log(`- ✅ 시간 필터 없음: 모든 메시지 가져옴`);
         }
 
-        // 4. 정렬 및 제한 (최신순 100개)
-        // Flutter ListView(reverse: true)를 쓰므로 DESC(내림차순)가 맞습니다.
-        // 화면엔 [최신 ... 과거] 순으로 오지만 reverse라서 [과거 ... 최신]으로 보입니다.
         query += ` ORDER BY m.created_at DESC LIMIT 100`;
 
-        // 5. 실행 및 응답
+        // 4. 실행
         const result = await db.query(query, params);
+        console.log(`✅ [DEBUG] 최종 조회된 메시지 개수: ${result.rows.length}개`);
+        
         res.json(result.rows);
 
     } catch (err) {
-        console.error(err);
+        console.error("❌ [DEBUG] 에러 발생:", err);
         res.status(500).json({ message: '메시지 로드 실패' });
     }
 });
