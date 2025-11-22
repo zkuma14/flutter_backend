@@ -828,7 +828,7 @@ app.get('/facilities', authenticateToken, async (req, res)=>{
 });
 
 //----------------------
-//운동 카테고리 API
+//운동 카테고리
 //----------------------
 
 app.get('/sports/categories', authenticateToken, async(req,res)=>{
@@ -877,6 +877,26 @@ wss.on('connection', (ws, req) => {
   } catch (err) {
     return ws.close(1008, '유효하지 않은 토큰');
   }
+
+  //실시간 매칭 용
+  ws.on('message', async(message)=>{
+    try{
+      const data = JSON.parse(message);
+
+      switch(data.type){
+        case 'join_match':
+          await handleJoinMatch(userId, data.payload);
+          break;
+        case 'cancle_match':
+          await handleJoinMatch(userId);
+          break;
+      }
+    }catch(e){
+      console.error('소켓 메시지 처리 오류:',e);
+    }
+  });
+
+  //
 
   ws.on('close', () => {
     if (userId) delete clients[userId]; 
@@ -971,6 +991,108 @@ async function broadcastMessage(roomId, message) {
     console.error("❌ [WS] 브로드캐스트 오류:", err);
   }
 }
+
+//실시간 매칭 로직
+async function handleJoinMatch(userId, payload) {
+  const {sport,lat,lng,target_count} = payload;
+  console.log('[MATCH] 유저(${userId}) 대기열 등록: ${sport}, ${target_count}명');
+
+  const client = await db.getClient();
+  try{
+    await client.query('BEGIN');
+    await client.query('DELETE FROM match_queue WHERE user_id = $1', [userId]);
+    await client.query(
+      `INSERT INTO match_queue (user_id, socket_id, sport, target_count, geom)
+      VALUES ($1, $2, $3, $4, ST_SetSRID(ST_MakePoint($5, $6), 4326))`,
+      [userId, 'socket_placeholder', sport, target_count, lng, lat]
+    );
+
+    await client.query('COMMIT');
+    await tryMatchMaking(client, sport, target_count);
+  }catch(err){
+    await client.query('ROLLBACK');
+    console.error('[MATCH] 등록 실패:',err);
+  }finally{
+    client.release();
+  }
+}
+async function tryMatchMaking(client, sport, targetCount) {
+  try {
+    // 2-1. 조건에 맞는 대기자 검색 (같은 종목, 같은 인원수)
+    // (거리 제한 3km 추가: ST_DWithin)
+    const query = `
+      SELECT user_id, ST_AsText(geom) as location
+      FROM match_queue 
+      WHERE sport = $1 
+        AND target_count = $2
+        AND is_active = TRUE
+      ORDER BY created_at ASC
+      LIMIT $2
+    `;
+    
+    const result = await client.query(query, [sport, targetCount]);
+    const members = result.rows;
+
+    // 2-2. 인원이 꽉 찼으면 매칭 성사!
+    if (members.length === parseInt(targetCount)) {
+      console.log(`[MATCH] 성사! 멤버: ${members.map(m=>m.user_id)}`);
+      
+      await client.query('BEGIN');
+
+      // A. 채팅방 생성
+      const roomRes = await client.query(
+        `INSERT INTO chat_rooms (room_name, last_message, last_message_timestamp) 
+         VALUES ($1, $2, NOW()) RETURNING id`,
+        [`⚡ ${sport} 퀵 매치`, '매칭이 성사되었습니다!']
+      );
+      const roomId = roomRes.rows[0].id;
+
+      // B. 참가자 추가
+      for (const member of members) {
+        await client.query(
+          `INSERT INTO participants (chat_room_id, user_id, unread_count) VALUES ($1, $2, 0)`,
+          [roomId, member.user_id]
+        );
+      }
+
+      // C. 대기열에서 삭제
+      const userIds = members.map(m => m.user_id);
+      await client.query(
+        `DELETE FROM match_queue WHERE user_id = ANY($1::int[])`,
+        [userIds]
+      );
+
+      await client.query('COMMIT');
+
+      // D. 알림 전송 (WebSocket)
+      const notifyPayload = JSON.stringify({
+        type: 'match_success',
+        payload: { roomId: roomId, sport: sport }
+      });
+
+      for (const member of members) {
+        const targetWs = clients[member.user_id];
+        if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+          targetWs.send(notifyPayload);
+        }
+      }
+    }
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('[MATCH] 매칭 프로세스 오류:', err);
+  }
+}
+
+// 3. 매칭 취소
+async function handleCancelMatch(userId) {
+  try {
+    await db.query('DELETE FROM match_queue WHERE user_id = $1', [userId]);
+    console.log(`[MATCH] 유저(${userId}) 취소됨`);
+  } catch (err) {
+    console.error('[MATCH] 취소 실패:', err);
+  }
+}
+
 // ---------------------------------
 // 10. 서버 시작
 // ---------------------------------
