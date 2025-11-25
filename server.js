@@ -726,7 +726,7 @@ app.post('/posts/:postId/join', authenticateToken, async (req, res) => {
         if (memberCheck.rows.length === 0) {
             // 3. 멤버 추가
             await client.query(
-                `INSERT INTO post_members (post_id, user_id, role, status) VALUES ($1, $2, 'MEMBER', 'ACCEPTED')`,
+                `INSERT INTO post_members (post_id, user_id, role, status) VALUES ($1, $2, 'MEMBER', 'ACCEPTED') ON CONFLICT DO NOTHING`,
                 [postId, userId]
             );
             
@@ -747,7 +747,10 @@ app.post('/posts/:postId/join', authenticateToken, async (req, res) => {
             }
 
             await client.query(
-                `INSERT INTO participants (chat_room_id, user_id, chat_name) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+                `INSERT INTO participants (chat_room_id, user_id, chat_name, is_hidden, left_at) 
+                VALUES ($1, $2, $3, FALSE, NULL) 
+                ON CONFLICT (chat_room_id, user_id) 
+                DO UPDATE SET is_hidden = FALSE, left_at = NULL`,
                 [post.chat_room_id, userId, myChatName]
             );
         }
