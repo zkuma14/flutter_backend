@@ -820,15 +820,32 @@ app.post('/posts/:postId/join', authenticateToken, async (req, res) => {
     }
 });
 
-// ⭐️ [추가] 조회수 증가 API
+// ⭐️ [수정] 조회수 증가 API (NULL 방지 + 로그 추가)
 app.post('/posts/:id/view', async (req, res) => {
     const { id } = req.params;
+    
+    console.log(`👀 조회수 증가 요청 들어옴: Post ID ${id}`);
+
     try {
-        await db.query('UPDATE posts SET view_count = view_count + 1 WHERE id = $1', [id]);
-        res.sendStatus(200);
+        // COALESCE(view_count, 0) -> 만약 값이 NULL이면 0으로 취급해서 +1 함
+        const result = await db.query(
+            `UPDATE posts 
+             SET view_count = COALESCE(view_count, 0) + 1 
+             WHERE id = $1 
+             RETURNING view_count`, 
+            [id]
+        );
+
+        if (result.rows.length > 0) {
+            console.log(`✅ 조회수 업데이트 성공! 현재: ${result.rows[0].view_count}`);
+            res.status(200).json({ views: result.rows[0].view_count });
+        } else {
+            console.log(`❌ 조회수 업데이트 실패: 게시글 ID(${id})를 찾을 수 없음`);
+            res.status(404).json({ message: '게시글을 찾을 수 없습니다.' });
+        }
     } catch (err) {
-        console.error(err);
-        res.sendStatus(500);
+        console.error("❌ 조회수 에러:", err);
+        res.status(500).json({ message: '서버 오류' });
     }
 });
 
