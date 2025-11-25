@@ -611,6 +611,8 @@ app.get('/posts', authenticateToken, async (req, res) => {
             SELECT 
                 p.id, p.title, p.content, p.exercise_type, p.max_players, 
                 p.status, p.exercise_datetime, p.chat_room_id,
+
+                p.view_count,
                 
                 p.user_id, -- ⭐️ [추가] 작성자 ID (익명 여부 상관없이 본인 확인용)
 
