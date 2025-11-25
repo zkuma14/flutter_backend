@@ -393,7 +393,7 @@ app.get('/rooms/:roomId/messages', authenticateToken, async (req, res) => {
     console.log(`\n🔍 [DEBUG] 메시지 로드 요청 시작 (방: ${roomId})`);
 
     try {
-        // 1. 권한 체크
+        // 1. 권한 체크 (참여자 명단에 있는지)
         const partCheck = await db.query(
             'SELECT 1 FROM participants WHERE chat_room_id = $1 AND user_id = $2',
             [roomId, userId]
@@ -403,26 +403,47 @@ app.get('/rooms/:roomId/messages', authenticateToken, async (req, res) => {
             return res.status(403).json({ message: '권한이 없습니다.' });
         }
 
-        // 2. 쿼리 생성
-        // ⭐️ [수정됨] p.profile_image -> u.profile_image 로 변경하고 users 테이블 조인 추가
+        // 2. [추가됨] 내 입장 시간 확인 (post_members 테이블에서 joined_at 가져오기)
+        // 게시글을 통해 들어온 경우, 가입한 시간 이전의 대화는 안 보이게 합니다.
+        const joinTimeRes = await db.query(`
+            SELECT pm.joined_at 
+            FROM post_members pm
+            JOIN posts p ON p.id = pm.post_id
+            WHERE p.chat_room_id = $1 AND pm.user_id = $2
+        `, [roomId, userId]);
+
+        // 기본값: 1970년 (모든 메시지 다 보임 - 일반 채팅방 등)
+        let filterDate = new Date(0); 
+        
+        // 게시글 채팅방 멤버라면, 가입 시간(joined_at)으로 필터링 날짜 설정
+        if (joinTimeRes.rows.length > 0) {
+            filterDate = new Date(joinTimeRes.rows[0].joined_at);
+            console.log(`🕒 [DEBUG] 필터링: ${filterDate.toISOString()} 이후 메시지만 표시`);
+        }
+
+        // 3. 쿼리 생성
+        // 조건: (채팅방 ID 일치) AND (작성시간 >= 내 입장시간)
         let query = `
             SELECT m.*, p.chat_name, u.profile_image
             FROM messages m
             LEFT JOIN participants p ON m.chat_room_id = p.chat_room_id AND m.sender_id = p.user_id
             LEFT JOIN users u ON m.sender_id = u.id
-            WHERE m.chat_room_id = $1
+            WHERE m.chat_room_id = $1 AND m.created_at >= $2
         `;
-        const params = [roomId];
+        
+        // 파라미터 배열: $1=roomId, $2=filterDate
+        const params = [roomId, filterDate];
 
-        // 3. leftAt 조건 적용
+        // 4. 추가 조건: leftAt (클라이언트가 이미 로딩한 시점 이후만 가져오기 - 더보기 기능용)
+        // 파라미터가 하나 추가되므로 $3이 됩니다.
         if (leftAt && leftAt !== 'null' && leftAt !== 'undefined') {
-            query += ` AND m.created_at > $2`;
+            query += ` AND m.created_at > $3`;
             params.push(leftAt);
         }
 
         query += ` ORDER BY m.created_at DESC LIMIT 100`;
 
-        // 4. 실행
+        // 5. 실행
         const result = await db.query(query, params);
         console.log(`✅ [DEBUG] 메시지 ${result.rows.length}개 로드 성공`);
         
@@ -692,7 +713,7 @@ app.post('/posts', authenticateToken, async (req, res) => {
   }
 });
 
-// ⭐️ [수정] POST /posts/:postId/join (참여하기 - 익명 번호 부여)
+// ⭐️ [수정] POST /posts/:postId/join (참여 + 시스템 메시지 + 히스토리 리셋)
 app.post('/posts/:postId/join', authenticateToken, async (req, res) => {
     const { postId } = req.params;
     const userId = req.user.userId;
@@ -702,7 +723,7 @@ app.post('/posts/:postId/join', authenticateToken, async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // 1. 게시글 정보 확인 (익명 여부 확인)
+        // 1. 게시글 정보 확인
         const postResult = await client.query(
             `SELECT p.*, 
               (SELECT COUNT(*) FROM post_members pm WHERE pm.post_id = p.id) AS current_players
@@ -714,66 +735,75 @@ app.post('/posts/:postId/join', authenticateToken, async (req, res) => {
         const post = postResult.rows[0];
         
         if (parseInt(post.current_players) >= post.max_players) {
-            throw new Error('인원이 가득 찼습니다.');
+            // 이미 멤버라면 인원수 체크 통과
+            const isMember = await client.query('SELECT 1 FROM post_members WHERE post_id=$1 AND user_id=$2', [postId, userId]);
+            if (isMember.rows.length === 0) {
+                throw new Error('인원이 가득 찼습니다.');
+            }
         }
 
-        // 2. 이미 참여했는지 확인
-        const memberCheck = await client.query(
-            'SELECT 1 FROM post_members WHERE post_id = $1 AND user_id = $2',
+        // 2. 멤버 추가 (이미 존재하면 joined_at을 최신으로 갱신 -> 이전 채팅 안 보이게 하려고!)
+        await client.query(
+            `INSERT INTO post_members (post_id, user_id, role, status, joined_at) 
+             VALUES ($1, $2, 'MEMBER', 'ACCEPTED', NOW()) 
+             ON CONFLICT (post_id, user_id) 
+             DO UPDATE SET joined_at = NOW(), status = 'ACCEPTED'`, 
             [postId, userId]
         );
-
-        if (memberCheck.rows.length === 0) {
-            // 3. 멤버 추가
-            await client.query(
-                `INSERT INTO post_members (post_id, user_id, role, status) VALUES ($1, $2, 'MEMBER', 'ACCEPTED') ON CONFLICT DO NOTHING`,
-                [postId, userId]
+        
+        // 3. 채팅방 참여 이름 결정
+        let myChatName = userDisplayName;
+        if (post.is_anonymous) {
+            // 내 이름이 이미 있는지 확인
+            const existName = await client.query(
+                'SELECT chat_name FROM participants WHERE chat_room_id = $1 AND user_id = $2',
+                [post.chat_room_id, userId]
             );
             
-            // 4. 채팅방 참여 (이름 결정)
-            let myChatName = userDisplayName;
-            
-            if (post.is_anonymous) {
-                // 현재 채팅방 인원수 조회 -> 다음 번호 부여
+            if (existName.rows.length > 0) {
+                myChatName = existName.rows[0].chat_name;
+            } else {
+                // 없으면 새 번호 부여
                 const countResult = await client.query(
                     'SELECT COUNT(*) FROM participants WHERE chat_room_id = $1',
                     [post.chat_room_id]
                 );
-                const nextNum = parseInt(countResult.rows[0].count) + 1; // 방장(1명) 있으니 2부터 시작하거나, 방장 포함 전체 수
-                // 방장이 '글쓴이'고 나머지가 '익명1'부터 시작하길 원한다면:
-                // 현재 1명(방장) -> 나는 '익명1'
-                // 현재 2명 -> 나는 '익명2'
-                myChatName = `익명${parseInt(countResult.rows[0].count)}`; 
-            }
-
-            const updateResult = await client.query(
-                `UPDATE participants 
-                 SET is_hidden = FALSE, left_at = NULL 
-                 WHERE chat_room_id = $1 AND user_id = $2 
-                 RETURNING *`,
-                [post.chat_room_id, userId]
-            );
-
-            // [2단계] 업데이트된 기록이 없다면? -> 아예 처음 들어오는 사람이므로 '새로 추가' (INSERT)
-            if (updateResult.rowCount === 0) {
-                await client.query(
-                    `INSERT INTO participants (chat_room_id, user_id, chat_name, is_hidden, left_at) 
-                     VALUES ($1, $2, $3, FALSE, NULL)`,
-                    [post.chat_room_id, userId, myChatName]
-                );
+                // 방장(1) + 멤버(n) = 다음 번호
+                myChatName = `익명${parseInt(countResult.rows[0].count) + 1}`; 
             }
         }
 
-        else {
-          await client.query(
+        // 4. 채팅방 참여 (participants) - 숨김 해제
+        const updateResult = await client.query(
             `UPDATE participants 
              SET is_hidden = FALSE, left_at = NULL 
-             WHERE chat_room_id = $1 AND user_id = $2`,
+             WHERE chat_room_id = $1 AND user_id = $2 
+             RETURNING *`,
             [post.chat_room_id, userId]
-          );
+        );
+
+        if (updateResult.rowCount === 0) {
+            await client.query(
+                `INSERT INTO participants (chat_room_id, user_id, chat_name, is_hidden, left_at) 
+                 VALUES ($1, $2, $3, FALSE, NULL)`,
+                [post.chat_room_id, userId, myChatName]
+            );
         }
 
+        // ⭐️ 5. [추가] 시스템 메시지 전송 ("익명3님이 참여했습니다")
+        // (단, 방금 막 들어온 경우에만 띄우는 게 좋지만, 여기선 재입장도 띄웁니다)
+        const sysMsg = `${myChatName}님이 모임에 참여하였습니다.`;
+        const msgResult = await client.query(
+            `INSERT INTO messages (chat_room_id, sender_id, text, msg_type) 
+             VALUES ($1, $2, $3, 'SYSTEM') RETURNING *`,
+            [post.chat_room_id, userId, sysMsg]
+        );
+
         await client.query('COMMIT');
+        
+        // 소켓 전송
+        broadcastMessage(post.chat_room_id, msgResult.rows[0]);
+
         res.json({ message: '참여 완료', chatRoomId: post.chat_room_id });
     } catch (err) {
         await client.query('ROLLBACK');
@@ -781,6 +811,79 @@ app.post('/posts/:postId/join', authenticateToken, async (req, res) => {
         res.status(500).json({ message: err.message || '참여 실패' });
     } finally {
         client.release();
+    }
+});
+
+// ⭐️ [추가] 조회수 증가 API
+app.post('/posts/:id/view', async (req, res) => {
+    const { id } = req.params;
+    try {
+        await db.query('UPDATE posts SET view_count = view_count + 1 WHERE id = $1', [id]);
+        res.sendStatus(200);
+    } catch (err) {
+        console.error(err);
+        res.sendStatus(500);
+    }
+});
+
+// ⭐️ [추가] 게시글 삭제 API (작성자만)
+app.delete('/posts/:id', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    const userId = req.user.userId;
+    const client = await db.getClient();
+
+    try {
+        await client.query('BEGIN');
+
+        // 1. 본인 확인
+        const check = await client.query('SELECT * FROM posts WHERE id = $1 AND user_id = $2', [id, userId]);
+        if (check.rows.length === 0) {
+            throw new Error('권한이 없거나 게시글이 없습니다.');
+        }
+        const chatRoomId = check.rows[0].chat_room_id;
+
+        // 2. 연관 데이터 삭제 (순서 중요: 멤버 -> 게시글 -> 메시지 -> 참가자 -> 채팅방)
+        await client.query('DELETE FROM post_members WHERE post_id = $1', [id]);
+        await client.query('DELETE FROM posts WHERE id = $1', [id]); // 게시글 삭제
+        
+        // 채팅방도 삭제할까요? (보통 게시글 지우면 방도 폭파)
+        if (chatRoomId) {
+            await client.query('DELETE FROM messages WHERE chat_room_id = $1', [chatRoomId]);
+            await client.query('DELETE FROM participants WHERE chat_room_id = $1', [chatRoomId]);
+            await client.query('DELETE FROM chat_rooms WHERE id = $1', [chatRoomId]);
+        }
+
+        await client.query('COMMIT');
+        res.sendStatus(200);
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err);
+        res.status(500).json({ message: '삭제 실패' });
+    } finally {
+        client.release();
+    }
+});
+
+// ⭐️ [추가] 게시글 수정 API (제목, 내용만)
+app.put('/posts/:id', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    const { title, content } = req.body; // 수정할 내용
+    const userId = req.user.userId;
+
+    try {
+        const result = await db.query(
+            `UPDATE posts SET title = $1, content = $2 
+             WHERE id = $3 AND user_id = $4 RETURNING *`,
+            [title, content, id, userId]
+        );
+        
+        if (result.rows.length === 0) {
+            return res.status(403).json({ message: '수정 권한이 없습니다.' });
+        }
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: '수정 실패' });
     }
 });
 
