@@ -764,6 +764,15 @@ app.post('/posts/:postId/join', authenticateToken, async (req, res) => {
             }
         }
 
+        else {
+          await client.query(
+            `UPDATE participants 
+             SET is_hidden = FALSE, left_at = NULL 
+             WHERE chat_room_id = $1 AND user_id = $2`,
+            [post.chat_room_id, userId]
+          );
+        }
+
         await client.query('COMMIT');
         res.json({ message: '참여 완료', chatRoomId: post.chat_room_id });
     } catch (err) {
