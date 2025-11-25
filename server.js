@@ -605,14 +605,13 @@ app.get('/posts', authenticateToken, async (req, res) => {
                 p.id, p.title, p.content, p.exercise_type, p.max_players, 
                 p.status, p.exercise_datetime, p.chat_room_id,
                 
-                -- ⭐️ [수정] 여기가 핵심입니다! 
-                -- is_anonymous가 true면 '익명'을, 아니면 본명을 author_name으로 줍니다.
+                p.user_id, -- ⭐️ [추가] 작성자 ID (익명 여부 상관없이 본인 확인용)
+
                 CASE 
                     WHEN p.is_anonymous = TRUE THEN '익명'
                     ELSE u.display_name 
                 END AS author_name,
 
-                -- (선택) 프로필 이미지도 익명이면 숨길까요? 필요하면 아래처럼 처리하세요.
                 CASE 
                     WHEN p.is_anonymous = TRUE THEN NULL 
                     ELSE u.profile_image 
