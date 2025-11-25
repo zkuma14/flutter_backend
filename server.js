@@ -242,8 +242,7 @@ app.get('/users', authenticateToken, async (req, res) => {
     }
 });
 
-// ⭐️ [대폭 수정] POST /rooms/:roomId/leave (방 나가기 + 모임 탈퇴 + 시스템 메시지)
-// (기존 /hide API를 /leave 로 변경하거나 기능을 덮어씁니다)
+// ⭐️ [수정] POST /rooms/:roomId/leave (방장이 나가면 게시글 삭제)
 app.post('/rooms/:roomId/leave', authenticateToken, async (req, res) => {
   const { roomId } = req.params;
   const userId = req.user.userId;
@@ -252,50 +251,58 @@ app.post('/rooms/:roomId/leave', authenticateToken, async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // 1. 내 채팅 이름 가져오기 (나갔습니다 메시지용)
-    const partResult = await client.query(
-        'SELECT chat_name FROM participants WHERE chat_room_id = $1 AND user_id = $2',
+    // 1. 이 방과 연결된 게시글이 있고, 내가 그 게시글의 작성자(LEADER)인지 확인
+    const postCheck = await client.query(
+        `SELECT id FROM posts WHERE chat_room_id = $1 AND user_id = $2`,
         [roomId, userId]
     );
-    const myName = partResult.rows.length > 0 ? partResult.rows[0].chat_name : '알 수 없음';
 
-    // 2. post_members 에서 삭제 (모임 탈퇴)
-    // (이 방과 연결된 post_id를 찾아서 삭제해야 함)
-    await client.query(`
-        DELETE FROM post_members 
-        WHERE user_id = $1 AND post_id = (SELECT id FROM posts WHERE chat_room_id = $2)
-    `, [userId, roomId]);
+    // 🚨 [CASE 1] 내가 방장이다 -> 게시글 폭파 (삭제)
+    if (postCheck.rows.length > 0) {
+        const postId = postCheck.rows[0].id;
+        console.log(`🚨 방장(${userId})이 나감 -> 게시글(${postId}) 및 채팅방 폭파`);
 
-    // 3. participants 업데이트 (숨김 처리 & 나간 시간 기록)
-    // (아예 DELETE 하지 않는 이유는, 나중에 다시 들어올 때 이름 기록 등을 유지하거나 로그를 남기기 위함이나,
-    //  사용자 요청은 "인원수 줄어들게" 이므로 여기서는 is_hidden 처리만 하고, 
-    //  클라이언트나 쿼리에서 is_hidden=false 인 사람만 카운트하도록 로직을 짜야 함.
-    //  하지만 확실한 인원 감소를 위해 DELETE를 하거나, COUNT 쿼리를 수정해야 함.
-    //  여기서는 **채팅방 목록에는 남기지 않으려면** is_hidden=TRUE가 맞습니다.)
-    await client.query(
-      'UPDATE participants SET is_hidden = TRUE, left_at = NOW() WHERE chat_room_id = $1 AND user_id = $2',
-      [roomId, userId]
-    );
+        // 연관 데이터 삭제 순서: 멤버 -> 게시글 -> 메시지 -> 참가자 -> 채팅방
+        await client.query('DELETE FROM post_members WHERE post_id = $1', [postId]);
+        await client.query('DELETE FROM posts WHERE id = $1', [postId]);
+        await client.query('DELETE FROM messages WHERE chat_room_id = $1', [roomId]);
+        await client.query('DELETE FROM participants WHERE chat_room_id = $1', [roomId]);
+        await client.query('DELETE FROM chat_rooms WHERE id = $1', [roomId]);
+    } 
+    // 💨 [CASE 2] 일반 멤버다 -> 그냥 나가기 (숨김 처리)
+    else {
+        // 내 채팅 이름 가져오기
+        const partResult = await client.query(
+            'SELECT chat_name FROM participants WHERE chat_room_id = $1 AND user_id = $2',
+            [roomId, userId]
+        );
+        const myName = partResult.rows.length > 0 ? partResult.rows[0].chat_name : '알 수 없음';
 
-    // 4. 시스템 메시지 전송 ('익명3님이 나갔습니다')
-    const sysMsg = `${myName}님이 모임에서 나갔습니다.`;
-    const msgResult = await client.query(
-        `INSERT INTO messages (chat_room_id, sender_id, text, msg_type) 
-         VALUES ($1, $2, $3, 'SYSTEM') RETURNING *`,
-        [roomId, userId, sysMsg]
-    );
+        // 모임 멤버에서 삭제
+        await client.query(`
+            DELETE FROM post_members 
+            WHERE user_id = $1 AND post_id = (SELECT id FROM posts WHERE chat_room_id = $2)
+        `, [userId, roomId]);
 
-    // 5. 채팅방 마지막 메시지 갱신
-    await client.query(
-        'UPDATE chat_rooms SET last_message = $1, last_message_timestamp = NOW() WHERE id = $2',
-        [sysMsg, roomId]
-    );
+        // 채팅방 숨김 처리
+        await client.query(
+            'UPDATE participants SET is_hidden = TRUE, left_at = NOW() WHERE chat_room_id = $1 AND user_id = $2',
+            [roomId, userId]
+        );
+
+        // 시스템 메시지 전송
+        const sysMsg = `${myName}님이 모임에서 나갔습니다.`;
+        const msgResult = await client.query(
+            `INSERT INTO messages (chat_room_id, sender_id, text, msg_type) 
+             VALUES ($1, $2, $3, 'SYSTEM') RETURNING *`,
+            [roomId, userId, sysMsg]
+        );
+        
+        // 소켓 전송
+        broadcastMessage(roomId, msgResult.rows[0]);
+    }
 
     await client.query('COMMIT');
-    
-    // 웹소켓 전송 (시스템 메시지 & 방 업데이트)
-    broadcastMessage(roomId, msgResult.rows[0]);
-
     res.sendStatus(200);
   } catch (err) {
     await client.query('ROLLBACK');
@@ -863,29 +870,66 @@ app.delete('/posts/:id', authenticateToken, async (req, res) => {
     }
 });
 
-// ⭐️ [추가] 게시글 수정 API (제목, 내용만)
+// ⭐️ [수정] PUT /posts/:id (모든 내용 수정 가능)
 app.put('/posts/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
-    const { title, content } = req.body; // 수정할 내용
+    // 💡 수정 가능한 모든 필드 받기
+    const { 
+        title, content, exercise_type, max_players, 
+        location_name, exercise_datetime, is_anonymous 
+    } = req.body; 
     const userId = req.user.userId;
 
+    const client = await db.getClient();
     try {
-        const result = await db.query(
-            `UPDATE posts SET title = $1, content = $2 
-             WHERE id = $3 AND user_id = $4 RETURNING *`,
-            [title, content, id, userId]
+        await client.query('BEGIN');
+
+        // 1. 장소 처리 (위치 이름이 바뀌었을 수 있으므로)
+        let finalLocationId;
+        if (location_name) {
+            const locCheck = await client.query('SELECT id FROM locations WHERE location_name = $1', [location_name]);
+            if (locCheck.rows.length > 0) { finalLocationId = locCheck.rows[0].id; } 
+            else {
+                const newLoc = await client.query('INSERT INTO locations (location_name, latitude, longitude, address) VALUES ($1, 0, 0, $1) RETURNING id', [location_name]);
+                finalLocationId = newLoc.rows[0].id;
+            }
+        }
+
+        // 2. 게시글 업데이트
+        // (COALESCE를 사용하여 입력된 값만 수정하고, 없으면 기존 값 유지)
+        const result = await client.query(
+            `UPDATE posts 
+             SET title = COALESCE($1, title), 
+                 content = COALESCE($2, content),
+                 exercise_type = COALESCE($3, exercise_type),
+                 max_players = COALESCE($4, max_players),
+                 location_id = COALESCE($5, location_id),
+                 exercise_datetime = COALESCE($6, exercise_datetime),
+                 is_anonymous = COALESCE($7, is_anonymous)
+             WHERE id = $8 AND user_id = $9 
+             RETURNING *`,
+            [title, content, exercise_type, max_players, finalLocationId, exercise_datetime, is_anonymous, id, userId]
         );
         
         if (result.rows.length === 0) {
-            return res.status(403).json({ message: '수정 권한이 없습니다.' });
+            throw new Error('수정 권한이 없거나 게시글이 없습니다.');
         }
-        res.json(result.rows[0]);
+
+        // 3. 채팅방 이름도 업데이트 (선택 사항: "[종목] 제목" 형식을 유지하려면)
+        const post = result.rows[0];
+        const newRoomName = `[${post.exercise_type}] ${post.title}`;
+        await client.query('UPDATE chat_rooms SET room_name = $1 WHERE id = $2', [newRoomName, post.chat_room_id]);
+
+        await client.query('COMMIT');
+        res.json(post);
     } catch (err) {
+        await client.query('ROLLBACK');
         console.error(err);
         res.status(500).json({ message: '수정 실패' });
+    } finally {
+        client.release();
     }
 });
-
 // ---------------------------------
 // 🗺️ 7. 맵 API (시설 정보 조회)
 // ---------------------------------
