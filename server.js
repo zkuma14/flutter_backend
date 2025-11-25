@@ -746,13 +746,22 @@ app.post('/posts/:postId/join', authenticateToken, async (req, res) => {
                 myChatName = `익명${parseInt(countResult.rows[0].count)}`; 
             }
 
-            await client.query(
-                `INSERT INTO participants (chat_room_id, user_id, chat_name, is_hidden, left_at) 
-                VALUES ($1, $2, $3, FALSE, NULL) 
-                ON CONFLICT (chat_room_id, user_id) 
-                DO UPDATE SET is_hidden = FALSE, left_at = NULL`,
-                [post.chat_room_id, userId, myChatName]
+            const updateResult = await client.query(
+                `UPDATE participants 
+                 SET is_hidden = FALSE, left_at = NULL 
+                 WHERE chat_room_id = $1 AND user_id = $2 
+                 RETURNING *`,
+                [post.chat_room_id, userId]
             );
+
+            // [2단계] 업데이트된 기록이 없다면? -> 아예 처음 들어오는 사람이므로 '새로 추가' (INSERT)
+            if (updateResult.rowCount === 0) {
+                await client.query(
+                    `INSERT INTO participants (chat_room_id, user_id, chat_name, is_hidden, left_at) 
+                     VALUES ($1, $2, $3, FALSE, NULL)`,
+                    [post.chat_room_id, userId, myChatName]
+                );
+            }
         }
 
         await client.query('COMMIT');
