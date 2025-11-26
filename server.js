@@ -1121,7 +1121,6 @@ wss.on('connection', (ws, req) => {
     } catch (err) {
       return ws.close(1008, '유효하지 않은 토큰');
     }
-  });
 
   //실시간 매칭 용
   ws.on('message', async(message)=>{
@@ -1155,6 +1154,7 @@ wss.on('connection', (ws, req) => {
       }
     }
   });
+});
 
 // ⭐️ 30초마다 연결 확인 (죽은 연결 정리)
 const interval = setInterval(function ping() {
@@ -1260,15 +1260,19 @@ async function handleJoinMatch(userId, payload) {
     );
 
     await client.query('COMMIT');
-    await tryMatchMaking(client, sport, target_count);
+    //await tryMatchMaking(client, sport, target_count);
   }catch(err){
     await client.query('ROLLBACK');
     console.error('[MATCH] 등록 실패:',err);
+    return;
   }finally{
     client.release();
   }
+  await tryMatchMaking(sport, target_count);
 }
-async function tryMatchMaking(client, sport, targetCount) {
+
+async function tryMatchMaking(sport, targetCount) {
+  const client  = await db.getClient();
   try {
     // 2-1. 조건에 맞는 대기자 검색 (같은 종목, 같은 인원수)
     // (거리 제한 3km 추가: ST_DWithin)
@@ -1332,6 +1336,8 @@ async function tryMatchMaking(client, sport, targetCount) {
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('[MATCH] 매칭 프로세스 오류:', err);
+  }finally{
+    client.release();
   }
 }
 
