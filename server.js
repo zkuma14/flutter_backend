@@ -1084,7 +1084,7 @@ app.get('/sports/categories', authenticateToken, async(req,res)=>{
     ORDER BY category;
   `;
 
-  const resule = await db.query(sql);
+  const result = await db.query(sql);
   res.json(result.rows);
   }catch(err){
     console.error('[EROOR] /sports/categories 오류:',err);
@@ -1118,9 +1118,10 @@ wss.on('connection', (ws, req) => {
     ws.on('pong', heartbeat); // ⭐️ 퐁 응답 시 생존 확인
 
     console.log(`[WS] 클라이언트 연결됨: ${userId}`);
-  } catch (err) {
-    return ws.close(1008, '유효하지 않은 토큰');
-  }
+    } catch (err) {
+      return ws.close(1008, '유효하지 않은 토큰');
+    }
+  });
 
   //실시간 매칭 용
   ws.on('message', async(message)=>{
@@ -1132,7 +1133,7 @@ wss.on('connection', (ws, req) => {
           await handleJoinMatch(userId, data.payload);
           break;
         case 'cancel_match':
-          console.log('유저({$userId}) 매칭 취소 요청')
+          console.log(`유저({$userId}) 매칭 취소 요청`)
           await handleCancelMatch(userId);
           break;
       }
@@ -1246,7 +1247,7 @@ async function broadcastMessage(roomId, message) {
 //실시간 매칭 로직
 async function handleJoinMatch(userId, payload) {
   const {sport,lat,lng,target_count} = payload;
-  console.log('[MATCH] 유저(${userId}) 대기열 등록: ${sport}, ${target_count}명');
+  console.log(`[MATCH] 유저(${userId}) 대기열 등록: ${sport}, ${target_count}명`);
 
   const client = await db.getClient();
   try{
