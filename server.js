@@ -1131,8 +1131,9 @@ wss.on('connection', (ws, req) => {
         case 'join_match':
           await handleJoinMatch(userId, data.payload);
           break;
-        case 'cancle_match':
-          await handleJoinMatch(userId);
+        case 'cancel_match':
+          console.log('유저({$userId}) 매칭 취소 요청')
+          await handleCancelMatch(userId);
           break;
       }
     }catch(e){
@@ -1142,9 +1143,13 @@ wss.on('connection', (ws, req) => {
 
   //
 
-  ws.on('close', () => {
+  ws.on('close', async () => {
     if (userId) delete clients[userId]; 
     console.log(`[WS] 클라이언트 연결 끊김: ${userId}`);
+    
+    //실시간 매칭 종료
+    await handleCancelMatch(userId);  
+    //
   });
 });
 
