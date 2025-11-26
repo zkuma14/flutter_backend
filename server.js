@@ -1143,15 +1143,17 @@ wss.on('connection', (ws, req) => {
 
   //
 
-  ws.on('close', async () => {
-    if (userId) delete clients[userId]; 
-    console.log(`[WS] 클라이언트 연결 끊김: ${userId}`);
-    
-    //실시간 매칭 종료
-    await handleCancelMatch(userId);  
-    //
+ ws.on('close', async () => {
+    if (userId) {
+      if (clients[userId] === ws) {
+        delete clients[userId];
+        console.log(`[WS] 클라이언트 연결 끊김: ${userId} (정상 삭제)`);
+        await handleCancelMatch(userId); 
+      } else {
+        console.log(`[WS] 이전 연결 끊김 무시: ${userId} (이미 새 연결 있음)`);
+      }
+    }
   });
-});
 
 // ⭐️ 30초마다 연결 확인 (죽은 연결 정리)
 const interval = setInterval(function ping() {
