@@ -20,6 +20,9 @@ const client = new OAuth2Client(GOOGLE_CLIENT_ID); // ⭐️ Google 클라이언
 app.use(cors());
 app.use(express.json());
 
+// ⭐️ [추가] 헬스 체크용 루트 경로 (서버 깨우기용)
+app.get('/', (req, res) => res.send('Server is awake! 🤖'));
+
 // ---------------------------------
 // 🔑 2. 인증 API (⭐️ Google 로그인 포함)
 // ---------------------------------
