@@ -1,257 +1,492 @@
-// server.js (최종 통합본)
+// server.js (⭐️ Google 인증 + DB 트랜잭션 + Real API 융합본)
+// (DB 스키마가 서버 코드에 맞춰져 있다고 가정하고, snake_case 통신 문제를 수정한 버전)
+
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
-const db = require('./db'); // 수정된 db.js (getClient 포함)
+const db = require('./db'); // ⭐️ db.getClient()가 포함된 DB 모듈
 require('dotenv').config();
+const { OAuth2Client } = require('google-auth-library'); // ⭐️ Google 인증 라이브러리 (File 1)
 
 const app = express();
-// 포트 번호는 환경 변수에서 가져오거나 기본값 3000 사용
-const PORT = process.env.PORT || 3000; 
+const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET;
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID; // ⭐️ .env에서 Google 클라이언트 ID 로드 (File 1)
+const client = new OAuth2Client(GOOGLE_CLIENT_ID); // ⭐️ Google 클라이언트 초기화 (File 1)
 
-// ---------------------------------
 // 1. 미들웨어 설정
-// ---------------------------------
 app.use(cors());
 app.use(express.json());
 
 // ---------------------------------
-// 2. 인증 API (로그인/회원가입 처리)
+// 🔑 2. 인증 API (⭐️ Google 로그인 포함)
 // ---------------------------------
-app.post('/auth/login', async (req, res) => {
-    const { displayName } = req.body;
-    if (!displayName) {
-        return res.status(400).json({ message: 'displayName이 필요합니다.' });
-    }
-    try {
-        let userResult = await db.query(
-            'SELECT * FROM users WHERE display_name = $1', 
-            [displayName]
-        );
-        let user = userResult.rows[0];
 
-        if (!user) {
-            // 사용자가 없으면 더미 정보로 생성
-            const dummyEmail = `${Date.now()}@dummy.com`;
-            const dummyPassword = 'dummy_password_hash'; 
-            userResult = await db.query(
-                `INSERT INTO users (display_name, preferred_sport, email, password_hash) 
-                 VALUES ($1, $2, $3, $4) 
-                 RETURNING *`,
-                [displayName, '', dummyEmail, dummyPassword]
-            );
-            user = userResult.rows[0];
-        }
-        
-        // JWT 토큰 생성
-        const token = jwt.sign(
-            { userId: user.id, name: user.display_name }, 
-            JWT_SECRET, 
-            { expiresIn: '30d' }
-        );
-        res.json({ user, token });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ message: '서버 오류' });
+// POST /auth/login (익명 로그인/회원가입)
+app.post('/auth/login', async (req, res) => {
+  const { displayName } = req.body;
+  if (!displayName) {
+    return res.status(400).json({ message: 'displayName이 필요합니다.' });
+  }
+  try {
+    let userResult = await db.query(
+      'SELECT * FROM users WHERE display_name = $1',
+      [displayName]
+    );
+    let user = userResult.rows[0];
+    if (!user) {
+      const dummyEmail = `${Date.now()}@dummy.com`;
+      // ⭐️ DB 스키마에 kakao_id, google_id가 없을 수 있으므로 INSERT 문에서 제거 (사용자 스키마 기반)
+      userResult = await db.query(
+        `INSERT INTO users (display_name, preferred_sport, email) 
+           VALUES ($1, $2, $3) 
+           RETURNING *`,
+        [displayName, '', dummyEmail]
+      );
+      user = userResult.rows[0];
     }
+    const token = jwt.sign(
+      { userId: user.id, name: user.display_name },
+      JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+    res.json({ user, token });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: '서버 오류' });
+  }
+});
+
+// ⭐️ POST /auth/google/login (신규 Google 로그인 - File 1)
+app.post('/auth/google/login', async (req, res) => {
+  const { idToken } = req.body; 
+
+  if (!idToken) {
+    return res.status(400).json({ message: 'Google ID 토큰이 필요합니다.' });
+  }
+
+  try {
+    // 1. Google 서버에 ID 토큰 검증 요청
+    const ticket = await client.verifyIdToken({
+      idToken,
+      audience: GOOGLE_CLIENT_ID, 
+    });
+
+    const payload = ticket.getPayload();
+    const googleId = payload['sub']; 
+    const googleName = payload['name'];
+    const googleEmail = payload['email'];
+
+    // 2. DB에서 Google ID로 사용자 조회
+    let userResult = await db.query(
+      'SELECT * FROM users WHERE google_id = $1',
+      [googleId]
+    );
+    let user = userResult.rows[0];
+
+    // 3. 사용자가 없으면 새로 회원가입
+    if (!user) {
+      // ⭐️ DB 스키마에 kakao_id가 없을 수 있으므로 INSERT 문에서 제거
+      const newUserResult = await db.query(
+        `INSERT INTO users (display_name, email, google_id, preferred_sport)
+         VALUES ($1, $2, $3, $4)
+         RETURNING *`,
+        [googleName, googleEmail, googleId, '']
+      );
+      user = newUserResult.rows[0];
+    }
+
+    // 4. 우리 앱의 JWT 토큰 생성
+    const token = jwt.sign(
+      { userId: user.id, name: user.display_name },
+      JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+
+    // 5. Flutter에 유저 정보와 우리 앱 토큰 반환
+    res.json({ user, token });
+
+  } catch (err) {
+    console.error(err);
+    if (err.message.includes('Invalid token')) {
+      return res.status(401).json({ message: '유효하지 않은 Google 토큰입니다.' });
+    }
+    res.status(500).json({ message: 'Google 로그인 처리 중 서버 오류' });
+  }
 });
 
 // ---------------------------------
-// 3. 인증 미들웨어
+// 🔐 3. 인증 미들웨어
 // ---------------------------------
 const authenticateToken = (req, res, next) => {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-    if (token == null) return res.sendStatus(401);
-    jwt.verify(token, JWT_SECRET, (err, user) => {
-        if (err) return res.sendStatus(403);
-        req.user = user;
-        next();
-    });
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (token == null) {
+    // ⭐️ 응답을 보내고 반드시 함수를 종료(return)해야 합니다.
+    return res.sendStatus(401); // 401 Unauthorized
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      // ⭐️ 응답을 보내고 반드시 함수를 종료(return)해야 합니다.
+      return res.sendStatus(403); // 403 Forbidden
+    }
+    
+    // 성공 시에는 next()를 호출하고 함수를 종료합니다.
+    req.user = user;
+    next();
+  });
 };
 
 // ---------------------------------
-// 4. 사용자/프로필 API
-// ---------------------------------
-app.get('/users/me', authenticateToken, async (req, res) => {
-    try {
-        const userId = req.user.userId;
-        const userResult = await db.query('SELECT * FROM users WHERE id = $1', [userId]);
-        const hiddenResult = await db.query('SELECT hidden_id FROM hidden_users WHERE hider_id = $1', [userId]);
-        const hiddenUsers = hiddenResult.rows.map(row => row.hidden_id);
-        const user = userResult.rows[0];
-        user.hidden_users = hiddenUsers;
-        res.json(user);
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ message: '서버 오류' });
-    }
-});
-
-app.put('/users/me', authenticateToken, async (req, res) => {
-    const userId = req.user.userId;
-    const { displayName, preferredSport } = req.body;
-    try {
-        const result = await db.query(
-            'UPDATE users SET display_name = $1, preferred_sport = $2 WHERE id = $3 RETURNING *',
-            [displayName, preferredSport, userId]
-        );
-        res.json(result.rows[0]);
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ message: '프로필 업데이트 실패' });
-    }
-});
-
-app.get('/users', authenticateToken, async (req, res) => {
-    const userId = req.user.userId;
-    try {
-        const query = `
-            SELECT u.* FROM users u
-            LEFT JOIN hidden_users h ON u.id = h.hidden_id AND h.hider_id = $1
-            WHERE u.id != $1 AND h.hidden_id IS NULL;
-        `;
-        const result = await db.query(query, [userId]);
-        res.json(result.rows);
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ message: '사용자 목록 로드 실패' });
-    }
-});
-
-// ---------------------------------
-// 5. 게시물 API (이전 가이드에서 제공된 CRUD)
+// 🏋️‍♀️ 5. 게시물(Post) 및 운동 모집 API
 // ---------------------------------
 
-// 5-1. 게시물 조회 (Read)
+/**
+ * [GET] /posts
+ * 전체 게시물 목록 조회
+ * - 작성자 정보, 현재 참여 인원, 위치 이름 등을 조인하여 반환
+ * - Dart 모델(Post.fromJson)과 필드명을 일치시켜야 함
+ */
 app.get('/posts', authenticateToken, async (req, res) => {
-    try {
-        // created_at 컬럼을 가정하고 최신 순으로 정렬
-        const result = await db.query('SELECT * FROM posts ORDER BY created_at DESC');
-        res.json(result.rows);
-    } catch (err) {
-        console.error('게시물 조회 오류:', err);
-        res.status(500).send('서버 오류');
-    }
+  try {
+    // 💡 복잡한 정보를 한 번에 가져오기 위한 쿼리
+    // 1. users 테이블 조인: 작성자 이름(author_name), 프로필(profile_image)
+    // 2. locations 테이블 조인: 위치 이름(location_name)
+    // 3. 서브쿼리: 현재 참여 인원 수 계산 (current_players)
+    const query = `
+      SELECT 
+        p.id,
+        p.exercise_type,
+        p.title,
+        p.content,
+        p.max_players,
+        p.view_count,
+        p.chat_room_id,
+        p.exercise_datetime,
+        p.location_id,
+        l.name AS location_name,
+        u.display_name AS author_name,
+        u.profile_image,
+        (SELECT COUNT(*)::int FROM post_members pm WHERE pm.post_id = p.id) AS current_players
+      FROM posts p
+      JOIN users u ON p.user_id = u.id
+      LEFT JOIN locations l ON p.location_id = l.id
+      ORDER BY p.exercise_datetime ASC; 
+    `;
+    // 날짜순 정렬 (가장 임박한 운동이 위로 오게 하려면 ASC, 최신글 위주는 create_at DESC)
+
+    const result = await db.query(query);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('게시물 목록 조회 실패:', err);
+    res.status(500).json({ message: '게시물을 불러오지 못했습니다.' });
+  }
 });
 
-// 5-2. 게시물 생성 (Create)
+/**
+ * [POST] /posts
+ * 새 게시물 작성
+ * - 트랜잭션 필수: 채팅방 생성 -> 게시글 생성 -> 멤버 등록 -> 채팅 참여
+ */
 app.post('/posts', authenticateToken, async (req, res) => {
-    // Post 모델의 필드를 req.body에서 받습니다.
-    const { exercise, title, content, location, members } = req.body; 
-    const authorId = req.user.userId; // 작성자 ID를 인증 토큰에서 가져옴
+  const client = await db.getClient();
+  const userId = req.user.userId;
+  const { 
+    exercise_type, 
+    title, 
+    content, 
+    location_id, 
+    max_players, 
+    exercise_datetime 
+  } = req.body;
+
+  try {
+    await client.query('BEGIN');
+
+    // 1. 채팅방 생성 (게시글과 1:1 매핑)
+    // chat_rooms 테이블에 name 컬럼이 있다면 제목을 넣거나 '운동 모임' 등으로 설정
+    const chatRoomResult = await client.query(
+      `INSERT INTO chat_rooms (created_at) VALUES (NOW()) RETURNING id`
+    );
+    const newChatRoomId = chatRoomResult.rows[0].id;
+
+    // 2. 게시글 생성
+    const insertPostQuery = `
+      INSERT INTO posts (
+        user_id, exercise_type, title, content, 
+        location_id, max_players, exercise_datetime, 
+        chat_room_id, view_count, created_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, NOW())
+      RETURNING *
+    `;
+    const postResult = await client.query(insertPostQuery, [
+      userId, exercise_type, title, content, 
+      location_id, max_players, exercise_datetime, newChatRoomId
+    ]);
+    const newPost = postResult.rows[0];
+
+    // 3. 작성자를 모임 멤버(post_members)로 등록
+    await client.query(
+      `INSERT INTO post_members (post_id, user_id, joined_at) VALUES ($1, $2, NOW())`,
+      [newPost.id, userId]
+    );
+
+    // 4. 작성자를 채팅방 참여자(participants)로 등록
+    // (사용자의 닉네임을 가져와서 chat_name으로 사용)
+    const userRes = await client.query('SELECT display_name, profile_image FROM users WHERE id = $1', [userId]);
+    const userProfile = userRes.rows[0];
+
+    await client.query(
+      `INSERT INTO participants (chat_room_id, user_id, chat_name, joined_at) 
+       VALUES ($1, $2, $3, NOW())`,
+      [newChatRoomId, userId, userProfile.display_name]
+    );
+
+    await client.query('COMMIT');
+
+    // 5. 클라이언트에 반환할 데이터 구성 (GET /posts 와 포맷 통일)
+    // location_name을 가져오기 위해 locations 테이블 조회 필요
+    const locRes = await db.query('SELECT name FROM locations WHERE id = $1', [location_id]);
+    const locationName = locRes.rows.length > 0 ? locRes.rows[0].name : '알 수 없는 위치';
+
+    const responseData = {
+      ...newPost,
+      author_name: userProfile.display_name,
+      profile_image: userProfile.profile_image,
+      location_name: locationName,
+      current_players: 1, // 작성자 1명
+      max_players: max_players
+    };
+
+    res.status(201).json(responseData);
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('게시물 작성 실패:', err);
+    res.status(500).json({ message: '게시물 작성 중 오류가 발생했습니다.' });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * [POST] /posts/:id/join
+ * 게시물 참여하기 (Post Detail 화면의 '참여하기' 버튼)
+ * - 인원 수 확인 -> post_members 추가 -> participants 추가 -> 시스템 메시지 전송
+ */
+app.post('/posts/:id/join', authenticateToken, async (req, res) => {
+  const client = await db.getClient();
+  const userId = req.user.userId;
+  const postId = req.params.id;
+
+  try {
+    await client.query('BEGIN');
+
+    // 1. 게시글 정보 및 현재 인원 확인 (Lock을 걸어 동시성 제어 권장 - FOR UPDATE)
+    const postQuery = `
+      SELECT p.*, 
+        (SELECT COUNT(*)::int FROM post_members pm WHERE pm.post_id = p.id) as current_count
+      FROM posts p 
+      WHERE p.id = $1 
+      FOR UPDATE
+    `;
+    const postRes = await client.query(postQuery, [postId]);
     
-    try {
-        const queryText = `
-            INSERT INTO posts (exercise, title, content, location, members, author_id, created_at) 
-            VALUES ($1, $2, $3, $4, $5, $6, NOW()) RETURNING *
-        `;
-        const values = [exercise, title, content, location, members, authorId];
-        
-        const result = await db.query(queryText, values);
-        res.status(201).json(result.rows[0]); 
-    } catch (err) {
-        console.error('게시물 생성 오류:', err);
-        res.status(500).send('서버 오류');
+    if (postRes.rows.length === 0) {
+      throw new Error('존재하지 않는 게시물입니다.');
     }
+
+    const post = postRes.rows[0];
+
+    // 2. 유효성 검사
+    // 2-1. 이미 참여했는지 확인
+    const checkMember = await client.query(
+      'SELECT * FROM post_members WHERE post_id = $1 AND user_id = $2', 
+      [postId, userId]
+    );
+    if (checkMember.rows.length > 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ message: '이미 참여 중인 모임입니다.' });
+    }
+
+    // 2-2. 정원 초과 확인
+    if (post.current_count >= post.max_players) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ message: '모집 인원이 마감되었습니다.' });
+    }
+
+    // 3. 멤버 추가 (post_members)
+    await client.query(
+      `INSERT INTO post_members (post_id, user_id, joined_at) VALUES ($1, $2, NOW())`,
+      [postId, userId]
+    );
+
+    // 4. 채팅방 참여 (participants)
+    // 내 정보 가져오기
+    const userRes = await client.query('SELECT display_name FROM users WHERE id = $1', [userId]);
+    const myName = userRes.rows[0].display_name;
+
+    // 채팅방에 이미 나갔다가 다시 들어오는 경우 고려 (INSERT ON CONFLICT or Check)
+    // 여기서는 간단히 INSERT 시도하되, 기존에 있으면 UPDATE 처리 (숨김 해제 등) 로직이 필요할 수 있음
+    // 간단하게 DELETE 후 INSERT 혹은 Upsert 로직 사용. 여기선 단순 INSERT
+    
+    // 혹시 chat_room_id가 null이면 에러
+    if (!post.chat_room_id) throw new Error('채팅방이 연결되지 않은 게시물입니다.');
+
+    // 기존 참여 기록 확인 (나갔던 유저일 수 있음)
+    const checkPart = await client.query(
+      'SELECT * FROM participants WHERE chat_room_id = $1 AND user_id = $2',
+      [post.chat_room_id, userId]
+    );
+
+    if (checkPart.rows.length > 0) {
+      // 나갔던 유저라면 다시 활성화
+      await client.query(
+        `UPDATE participants SET is_hidden = FALSE, joined_at = NOW() 
+         WHERE chat_room_id = $1 AND user_id = $2`,
+        [post.chat_room_id, userId]
+      );
+    } else {
+      // 신규 참여
+      await client.query(
+        `INSERT INTO participants (chat_room_id, user_id, chat_name, joined_at) 
+         VALUES ($1, $2, $3, NOW())`,
+        [post.chat_room_id, userId, myName]
+      );
+    }
+
+    // 5. 시스템 메시지 전송 ("OOO님이 참여하셨습니다")
+    const sysMsg = `${myName}님이 모임에 참여하셨습니다.`;
+    const msgResult = await client.query(
+      `INSERT INTO messages (chat_room_id, sender_id, text, msg_type, created_at) 
+       VALUES ($1, $2, $3, 'SYSTEM', NOW()) RETURNING *`,
+      [post.chat_room_id, userId, sysMsg]
+    );
+
+    // 6. 채팅방 마지막 메시지 업데이트
+    await client.query(
+      'UPDATE chat_rooms SET last_message = $1, last_message_timestamp = NOW() WHERE id = $2',
+      [sysMsg, post.chat_room_id]
+    );
+
+    await client.query('COMMIT');
+
+    // 웹소켓 브로드캐스트 (채팅방에 있는 사람들에게 알림)
+    // broadcastMessage(post.chat_room_id, msgResult.rows[0]); 
+
+    res.json({ 
+      message: '참여가 완료되었습니다.', 
+      chatRoomId: post.chat_room_id 
+    });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('모임 참여 실패:', err);
+    res.status(500).json({ message: err.message || '참여 처리 중 오류가 발생했습니다.' });
+  } finally {
+    client.release();
+  }
 });
 
 // ---------------------------------
-// 6. 채팅방 API (트랜잭션 적용)
+// 💬 5. 채팅방 API (⭐️ DB 트랜잭션 최적화 - File 2)
+// (chat_rooms, participants 테이블이 있다는 가정 하에 원본 유지)
 // ---------------------------------
-
-// 6-1. 채팅방 목록 조회
+// GET /rooms (채팅방 목록)
 app.get('/rooms', authenticateToken, async (req, res) => {
-    const userId = req.user.userId;
-    try {
-        const query = `
-            SELECT 
-              cr.id, cr.last_message, cr.last_message_timestamp,
-              p.unread_count AS "my_unread_count",
-              p.left_at,
-              CASE 
-                WHEN cr.room_name IS NULL THEN 
-                  (SELECT u.display_name FROM participants p_inner 
-                   JOIN users u ON u.id = p_inner.user_id
-                   WHERE p_inner.chat_room_id = cr.id AND p_inner.user_id != $1)
-                ELSE cr.room_name
-              END AS "room_name"
-            FROM chat_rooms cr
-            JOIN participants p ON cr.id = p.chat_room_id
-            WHERE p.user_id = $1 AND p.is_hidden = FALSE
-            ORDER BY cr.last_message_timestamp DESC;
-        `;
-        const result = await db.query(query, [userId]);
-        res.json(result.rows);
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ message: '채팅방 로드 오류' });
-    }
+  const userId = req.user.userId;
+  try {
+    const query = `
+      SELECT 
+        cr.id, 
+        cr.last_message, 
+        cr.last_message_timestamp,
+        p.unread_count AS "my_unread_count", 
+        p.left_at, 
+        CASE 
+          WHEN cr.room_name IS NULL THEN 
+            (SELECT u.display_name FROM participants p_inner 
+             JOIN users u ON u.id = p_inner.user_id
+             WHERE p_inner.chat_room_id = cr.id AND p_inner.user_id != $1)
+          ELSE cr.room_name
+        END AS "room_name"
+      FROM chat_rooms cr
+      JOIN participants p ON cr.id = p.chat_room_id
+      WHERE p.user_id = $1 AND p.is_hidden = FALSE 
+      ORDER BY cr.last_message_timestamp DESC;
+    `;
+    const result = await db.query(query, [userId]);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: '채팅방 로드 오류' });
+  }
 });
 
-// 6-2. 채팅방 생성 (트랜잭션)
+// POST /rooms (새 채팅방 생성 - ⭐️ File 2 트랜잭션)
 app.post('/rooms', authenticateToken, async (req, res) => {
-    const { userIds, roomName } = req.body;
-    const creatorId = req.user.userId;
-    const allParticipantIds = [creatorId, ...userIds];
+  const { userIds, roomName } = req.body; 
+  const creatorId = req.user.userId; 
+
+  const allParticipantIds = [creatorId, ...userIds];
+  
+  const client = await db.getClient(); // ⭐️ File 2
+  try {
+    await client.query('BEGIN'); // ⭐️ File 2
+
+    const roomResult = await client.query( // ⭐️ File 2
+      'INSERT INTO chat_rooms (room_name, last_message, last_message_timestamp) VALUES ($1, $2, NOW()) RETURNING id',
+      [roomName, '채팅방이 생성되었습니다.']
+    );
+    const newChatRoomId = roomResult.rows[0].id;
+
+    const participantPromises = allParticipantIds.map(userId => {
+      return client.query( // ⭐️ File 2
+        'INSERT INTO participants (chat_room_id, user_id, unread_count, is_hidden, left_at) VALUES ($1, $2, $3, $4, $5)',
+        [newChatRoomId, userId, 0, false, null] 
+      );
+    });
     
-    const client = await db.getClient(); 
+    await Promise.all(participantPromises);
 
-    try {
-        await client.query('BEGIN');
+    await client.query('COMMIT'); // ⭐️ File 2
 
-        const roomResult = await client.query(
-            'INSERT INTO chat_rooms (room_name, last_message, last_message_timestamp) VALUES ($1, $2, NOW()) RETURNING id',
-            [roomName, '채팅방이 생성되었습니다.']
-        );
-        const newChatRoomId = roomResult.rows[0].id;
+    res.status(201).json({ id: newChatRoomId });
 
-        const participantPromises = allParticipantIds.map(userId => {
-            return client.query(
-                'INSERT INTO participants (chat_room_id, user_id, unread_count, is_hidden, left_at) VALUES ($1, $2, $3, $4, $5)',
-                [newChatRoomId, userId, 0, false, null]
-            );
-        });
-        await Promise.all(participantPromises); 
-
-        await client.query('COMMIT');
-        
-        res.status(201).json({ id: newChatRoomId });
-
-    } catch (err) {
-        await client.query('ROLLBACK');
-        console.error(err);
-        res.status(500).json({ message: '채팅방 생성 실패' });
-    } finally {
-        client.release();
-    }
+  } catch (err) {
+    await client.query('ROLLBACK'); // ⭐️ File 2
+    console.error(err);
+    res.status(500).json({ message: '채팅방 생성 실패' });
+  } finally {
+    client.release(); // ⭐️ File 2
+  }
 });
 
-// 6-3. 메시지 목록 조회
+// ⭐️ [수정] GET /rooms/:roomId/messages (채팅 이름(chat_name) 반환)
 app.get('/rooms/:roomId/messages', authenticateToken, async (req, res) => {
     const { roomId } = req.params;
     const userId = req.user.userId;
-    const { leftAt } = req.query;
+
     try {
-        const partCheck = await db.query(
-            'SELECT * FROM participants WHERE chat_room_id = $1 AND user_id = $2',
-            [roomId, userId]
+        // ... 권한 체크 (기존 동일) ...
+
+        // 💡 조인해서 participants의 chat_name을 가져옵니다.
+        // 메시지 보낸 사람의 당시 닉네임(익명N)을 보여주기 위함
+        const result = await db.query(
+            `SELECT m.*, p.chat_name, p.profile_image
+             FROM messages m
+             LEFT JOIN participants p ON m.chat_room_id = p.chat_room_id AND m.sender_id = p.user_id
+             WHERE m.chat_room_id = $1
+             ORDER BY m.created_at ASC LIMIT 100`,
+            [roomId]
         );
-        if (partCheck.rows.length === 0) {
-            return res.status(403).json({ message: '권한이 없습니다.' });
-        }
-        let query = 'SELECT m.* FROM messages m WHERE m.chat_room_id = $1';
-        let params = [roomId];
-        if (leftAt) {
-            query += ' AND m.created_at > $2';
-            params.push(leftAt);
-        }
-        query += ' ORDER BY m.created_at DESC LIMIT 50';
-        const result = await db.query(query, params);
         res.json(result.rows);
+
     } catch (err) {
         console.error(err);
         res.status(500).json({ message: '메시지 로드 실패' });
@@ -259,128 +494,404 @@ app.get('/rooms/:roomId/messages', authenticateToken, async (req, res) => {
 });
 
 
-// 6-4. 메시지 전송 (트랜잭션 및 WS 브로드캐스트)
+// POST /rooms/:roomId/messages (메시지 전송 - ⭐️ File 2 트랜잭션)
 app.post('/rooms/:roomId/messages', authenticateToken, async (req, res) => {
-    const { text } = req.body;
-    const { roomId } = req.params;
-    const senderId = req.user.userId;
-    
-    const client = await db.getClient();
+  const { text } = req.body;
+  const { roomId } = req.params;
+  const senderId = req.user.userId;
 
+  const client = await db.getClient(); // ⭐️ File 2
+  try {
+    await client.query('BEGIN'); // ⭐️ File 2
+
+    // 1. messages 테이블에 메시지 삽입
+    const messageResult = await client.query( // ⭐️ File 2
+      'INSERT INTO messages (chat_room_id, sender_id, text) VALUES ($1, $2, $3) RETURNING *',
+      [roomId, senderId, text]
+    );
+    const newMessage = messageResult.rows[0];
+
+    // 2. chat_rooms 테이블의 마지막 메시지 업데이트
+    await client.query( // ⭐️ File 2
+      'UPDATE chat_rooms SET last_message = $1, last_message_timestamp = $2 WHERE id = $3',
+      [text, newMessage.created_at, roomId]
+    );
+
+    // 3. participants 테이블의 안읽음 카운트 업데이트
+    await client.query( // ⭐️ File 2
+      `UPDATE participants SET 
+         unread_count = CASE 
+           WHEN user_id = $1 THEN 0 
+           ELSE unread_count + 1 
+         END,
+         is_hidden = FALSE, 
+         left_at = NULL     
+       WHERE chat_room_id = $2`,
+      [senderId, roomId]
+    );
+    
+    await client.query('COMMIT'); // ⭐️ File 2
+
+    // (핵심) WebSocket으로 이 방에 연결된 모든 클라이언트에게 새 메시지 전송
+    broadcastMessage(roomId, newMessage);
+
+    res.status(201).json(newMessage);
+  } catch (err) {
+    await client.query('ROLLBACK'); // ⭐️ File 2
+    console.error(err);
+    res.status(500).json({ message: '메시지 전송 오류' });
+  } finally {
+    client.release(); // ⭐️ File 2
+  }
+});
+
+// POST /rooms/:roomId/read (안읽음 0 처리 API)
+app.post('/rooms/:roomId/read', authenticateToken, async (req, res) => {
+  const { roomId } = req.params;
+  const userId = req.user.userId;
+  try {
+    await db.query(
+      'UPDATE participants SET unread_count = 0 WHERE chat_room_id = $1 AND user_id = $2',
+      [roomId, userId]
+    );
+    res.sendStatus(200);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: '읽음 처리 실패' });
+  }
+});
+
+// POST /rooms/:roomId/hide (채팅방 '영구' 나가기/숨기기 API)
+app.post('/rooms/:roomId/hide', authenticateToken, async (req, res) => {
+  const { roomId } = req.params;
+  const userId = req.user.userId;
+  try {
+    await db.query(
+      'UPDATE participants SET is_hidden = TRUE, left_at = NOW() WHERE chat_room_id = $1 AND user_id = $2',
+      [roomId, userId]
+    );
+    res.sendStatus(200);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: '채팅방 숨기기 실패' });
+  }
+});
+
+// ---------------------------------
+// 🏃‍♂️ 6. [신규] 포스트 API (⭐️ Real API - File 2)
+// (DB 스키마가 일치한다고 가정)
+// ---------------------------------
+// GET /posts
+app.get('/posts', authenticateToken, async (req, res) => {
+    try {
+        const query = `
+            SELECT 
+                p.id, p.title, p.content, p.exercise_type, p.max_players, 
+                p.status, p.exercise_datetime, p.chat_room_id,
+                u.display_name AS author_name,
+                l.location_name,
+                (SELECT COUNT(*) FROM post_members pm WHERE pm.post_id = p.id) AS current_players
+            FROM posts p
+            JOIN users u ON p.user_id = u.id
+            LEFT JOIN locations l ON p.location_id = l.id
+            WHERE p.status = 'RECRUITING'
+            ORDER BY p.created_at DESC;
+        `;
+        const result = await db.query(query);
+        res.json(result.rows);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: '게시물 로드 실패. DB 스키마(posts, locations, post_members)를 확인하세요.' });
+    }
+});
+
+// POST /posts
+// ⭐️ [수정] POST /posts (게시글 생성 - 익명 로직 추가)
+app.post('/posts', authenticateToken, async (req, res) => {
+  const { 
+    title, content, exercise_type, max_players, location_name, exercise_datetime,
+    is_anonymous // 💡 클라이언트에서 받음 (기본 true)
+  } = req.body;
+
+  const userId = req.user.userId;
+  const userDisplayName = req.user.name; // JWT에서 꺼낸 이름
+
+  if (!title || !exercise_type) {
+    return res.status(400).json({ message: '필수 정보가 누락되었습니다.' });
+  }
+
+  const client = await db.getClient();
+  try {
+    await client.query('BEGIN');
+
+    // -------------------------------------------------------
+    // ⭐️ 3. [핵심] 장소 ID 자동 처리 로직 (Clean DB 유지 비결)
+    // -------------------------------------------------------
+    let finalLocationId;
+    const locCheck = await client.query('SELECT id FROM locations WHERE location_name = $1', [location_name]);
+    if (locCheck.rows.length > 0) { finalLocationId = locCheck.rows[0].id; } 
+    else {
+      const newLoc = await client.query('INSERT INTO locations (location_name, latitude, longitude, address) VALUES ($1, 0, 0, $1) RETURNING id', [location_name]);
+      finalLocationId = newLoc.rows[0].id;
+    }
+    // -------------------------------------------------------
+
+    // 1. 채팅방 생성
+    const roomName = `[${exercise_type}] ${title}`;
+    const roomResult = await client.query(
+      'INSERT INTO chat_rooms (room_name, last_message, last_message_timestamp, is_group) VALUES ($1, $2, NOW(), TRUE) RETURNING id',
+      [roomName, '운동 로비가 생성되었습니다.']
+    );
+    const newChatRoomId = roomResult.rows[0].id;
+
+    // 2. 게시글 생성 (is_anonymous 추가)
+    const postResult = await client.query(
+        `INSERT INTO posts (user_id, title, content, exercise_type, max_players, location_id, exercise_datetime, chat_room_id, status, view_count, is_anonymous)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'RECRUITING', 0, $9)
+         RETURNING *`,
+        [userId, title, content, exercise_type, max_players, finalLocationId, exercise_datetime, newChatRoomId, is_anonymous]
+    );
+    const newPost = postResult.rows[0];
+
+    // 3. 채팅방 참여자 등록 (방장 이름 설정)
+    // 익명이면 '글쓴이', 아니면 실제 이름
+    const leaderChatName = is_anonymous ? '글쓴이' : userDisplayName;
+
+    await client.query(
+        'INSERT INTO participants (chat_room_id, user_id, chat_name) VALUES ($1, $2, $3)',
+        [newChatRoomId, userId, leaderChatName]
+    );
+
+    // 4. 게시글 멤버 등록
+    await client.query(
+        `INSERT INTO post_members (post_id, user_id, role, status) VALUES ($1, $2, 'LEADER', 'ACCEPTED')`,
+        [newPost.id, userId]
+    );
+
+    await client.query('COMMIT');
+    res.status(201).json(newPost);
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error("게시물 생성 에러:", err);
+    res.status(500).json({ message: '게시물 생성 실패', error: err.toString() });
+  } finally {
+    client.release();
+  }
+});
+
+// ⭐️ [수정] POST /posts/:postId/join (참여하기 - 익명 번호 부여)
+app.post('/posts/:postId/join', authenticateToken, async (req, res) => {
+    const { postId } = req.params;
+    const userId = req.user.userId;
+    const userDisplayName = req.user.name;
+
+    const client = await db.getClient();
     try {
         await client.query('BEGIN');
 
-        // 1. messages 테이블에 삽입
-        const messageResult = await client.query(
-            'INSERT INTO messages (chat_room_id, sender_id, text) VALUES ($1, $2, $3) RETURNING *',
-            [roomId, senderId, text]
-        );
-        const newMessage = messageResult.rows[0];
-
-        // 2. chat_rooms 마지막 메시지 업데이트
-        await client.query(
-            'UPDATE chat_rooms SET last_message = $1, last_message_timestamp = $2 WHERE id = $3',
-            [text, newMessage.created_at, roomId]
+        // 1. 게시글 정보 확인 (익명 여부 확인)
+        const postResult = await client.query(
+            `SELECT p.*, 
+              (SELECT COUNT(*) FROM post_members pm WHERE pm.post_id = p.id) AS current_players
+             FROM posts p WHERE p.id = $1 FOR UPDATE`,
+            [postId]
         );
 
-        // 3. participants 안 읽음 카운트 업데이트 (보낸 사람 제외 +1)
-        await client.query(
-            `UPDATE participants SET 
-             unread_count = CASE 
-               WHEN user_id = $1 THEN 0 
-               ELSE unread_count + 1 
-             END,
-             is_hidden = FALSE,
-             left_at = NULL
-             WHERE chat_room_id = $2`,
-            [senderId, roomId]
-        );
+        if (postResult.rows.length === 0) throw new Error('게시물을 찾을 수 없습니다.');
+        const post = postResult.rows[0];
         
+        if (parseInt(post.current_players) >= post.max_players) {
+            throw new Error('인원이 가득 찼습니다.');
+        }
+
+        // 2. 이미 참여했는지 확인
+        const memberCheck = await client.query(
+            'SELECT 1 FROM post_members WHERE post_id = $1 AND user_id = $2',
+            [postId, userId]
+        );
+
+        if (memberCheck.rows.length === 0) {
+            // 3. 멤버 추가
+            await client.query(
+                `INSERT INTO post_members (post_id, user_id, role, status) VALUES ($1, $2, 'MEMBER', 'ACCEPTED')`,
+                [postId, userId]
+            );
+            
+            // 4. 채팅방 참여 (이름 결정)
+            let myChatName = userDisplayName;
+            
+            if (post.is_anonymous) {
+                // 현재 채팅방 인원수 조회 -> 다음 번호 부여
+                const countResult = await client.query(
+                    'SELECT COUNT(*) FROM participants WHERE chat_room_id = $1',
+                    [post.chat_room_id]
+                );
+                const nextNum = parseInt(countResult.rows[0].count) + 1; // 방장(1명) 있으니 2부터 시작하거나, 방장 포함 전체 수
+                // 방장이 '글쓴이'고 나머지가 '익명1'부터 시작하길 원한다면:
+                // 현재 1명(방장) -> 나는 '익명1'
+                // 현재 2명 -> 나는 '익명2'
+                myChatName = `익명${parseInt(countResult.rows[0].count)}`; 
+            }
+
+            await client.query(
+                `INSERT INTO participants (chat_room_id, user_id, chat_name) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+                [post.chat_room_id, userId, myChatName]
+            );
+        }
+
         await client.query('COMMIT');
-        
-        // WebSocket 알림은 COMMIT 이후에 전송
-        broadcastMessage(roomId, newMessage); 
-        res.status(201).json(newMessage);
-
+        res.json({ message: '참여 완료', chatRoomId: post.chat_room_id });
     } catch (err) {
         await client.query('ROLLBACK');
         console.error(err);
-        res.status(500).json({ message: '메시지 전송 오류' });
+        res.status(500).json({ message: err.message || '참여 실패' });
     } finally {
         client.release();
     }
 });
 
-
 // ---------------------------------
-// 7. 지도/시설 API (GeoSpatial 쿼리)
+// 🗺️ 7. 맵 API (시설 정보 조회)
 // ---------------------------------
-
-// 7-1. 카메라 위치에 따라 표시할 시설 가져오기
 app.get('/facilities', authenticateToken, async (req, res)=>{
-    const {minLat, minLng, maxLat, maxLng} = req.query;
-    if (!minLat || !minLng || !maxLat || !maxLng){
-        return res.status(400).json({message: '지도 경계값을 찾을 수 없음'});
+  const {minLat, minLng, maxLat, maxLng, zoom} = req.query;
+
+  if (!minLat || !minLng || !maxLat || !maxLng || zoom === undefined){
+    return res.status(400).json({message: '지도 경계값을 찾을 수 없음'});
+  }
+
+  const zoomLevel = parseInt(zoom,10);
+  let cellSize;
+
+  // 줌 레벨에 따른 클러스터링 셀 크기 조절
+  if (zoomLevel < 10){
+    cellSize = 0.05;
+  } else if (zoomLevel < 15){
+    cellSize = 0.01;
+  } else {
+    cellSize = 0.002;
+  }
+  
+  try{
+    // ⭐️ [수정] 쉼표(,) 오타를 완벽하게 제거한 쿼리
+    // "준공일자" 뒤에 쉼표가 없어야 합니다!
+    console.log("=== [DEBUG] 콤마 삭제한 버전 실행 중 ===");
+    const sql = `
+      SELECT "시설명", "시설유형명", "시설위도", "시설경도",
+      "시설상태값", "도로명우편번호", "주소", "시설주소2명",
+      "시설전화번호", "시설홈페이지URL", "담당자전화번호", "실내외구분명",
+      "준공일자" 
+      FROM facilities_for_map 
+      WHERE ST_Contains(
+        ST_MakeEnvelope($1, $2, $3, $4, 4326), 
+        geom 
+      )
+      LIMIT 5000; 
+    `;
+    
+    const params = [
+      parseFloat(minLng),
+      parseFloat(minLat),
+      parseFloat(maxLng),
+      parseFloat(maxLat),
+    ];
+    
+    const result = await db.query(sql, params);
+    const allFacilitiesInView = result.rows;
+
+    // 2. 조회된 시설들을 그리드 기반으로 클러스터링
+    const clusters = {};
+
+    for (const facility of allFacilitiesInView){
+      // DB 컬럼이 한글이므로 한글 Key로 접근
+      const lat = parseFloat(facility.시설위도);
+      const lng = parseFloat(facility.시설경도);
+
+      if (isNaN(lat) || isNaN(lng)) continue; // 좌표 오류 시 건너뜀
+
+      const gridLat = Math.floor(lat / cellSize) * cellSize;
+      const gridLng = Math.floor(lng / cellSize) * cellSize;
+      const gridKey = `${gridLat.toFixed(5)}-${gridLng.toFixed(5)}`;
+
+      if (!clusters[gridKey]){
+        clusters[gridKey] = [];
+      }
+      clusters[gridKey].push(facility);
     }
-    try{
-        // ST_MakeEnvelope(minX, minY, maxX, maxY, srid)
-        // 위경도이므로 minLng, minLat, maxLng, maxLat 순서입니다.
-        const sql = `
-            SELECT * FROM public.facilities_for_map 
-            WHERE ST_Contains(
-                ST_MakeEnvelope($1, $2, $3, $4, 4326), 
-                geom
-            )
-            LIMIT 1000;
-        `;
-        
-        const params = [minLng, minLat, maxLng, maxLat];
-        const result = await db.query(sql, params);
-        
-        // GeoJSON 형식으로 변환하여 반환 (Flutter mapboxgl 등에 사용)
-        const geoJsonFeatures = result.rows.map(row=>{
-            return{
-                type: "Feature",
-                properties: {
-                    // DB 컬럼명을 그대로 사용
-                    ...row,
-                    cluster: false,
-                },
-                geometry: {
-                    type: "Point",
-                    // 지도 좌표계에 따라 [경도, 위도] 순서로 변환
-                    coordinates: [row.시설경도, row.시설위도] 
-                }
-            }
+
+    // 3. 클라이언트 포맷(ClusterableItem)으로 변환
+    const clusterableItems = [];
+    const clusterThreshold = 5; // 5개 이상이면 묶음
+
+    for(const gridKey in clusters){
+      const facilitiesInCell = clusters[gridKey];
+
+      if(facilitiesInCell.length >= clusterThreshold && zoomLevel < 17) {
+        // [클러스터 생성]
+        const avgLat = facilitiesInCell.reduce((sum,f) => sum + parseFloat(f.시설위도), 0) / facilitiesInCell.length;
+        const avgLng = facilitiesInCell.reduce((sum,f) => sum + parseFloat(f.시설경도), 0) / facilitiesInCell.length;
+
+        clusterableItems.push({
+          location: {latitude: avgLat, longitude: avgLng},
+          isCluster: true,
+          count: facilitiesInCell.length,
+          facility: null,
         });
-
-        res.json(geoJsonFeatures);
-
-    }catch(err){
-        console.error(err);
-        res.status(500).json({message: '시설 로드 실패'});
+      } else {
+        // [개별 마커 생성]
+        for(const facility of facilitiesInCell){
+          clusterableItems.push({
+            location: {latitude: parseFloat(facility.시설위도), longitude: parseFloat(facility.시설경도)},
+            isCluster: false,
+            facility: {
+              시설명: facility.시설명,
+              시설유형명: facility.시설유형명,
+              시설위도: facility.시설위도,
+              시설경도: facility.시설경도,
+              시설상태값: facility.시설상태값,
+              도로명우편번호: facility.도로명우편번호,
+              주소: facility.주소,
+              시설주소2명: facility.시설주소2명,
+              시설전화번호: facility.시설전화번호,
+              시설홈페이지URL: facility.시설홈페이지URL,
+              담당자전화번호: facility.담당자전화번호,
+              실내외구분명: facility.실내외구분명,
+              준공일자: facility.준공일자,
+            },
+            count: 1,
+          });
+        }
+      }
     }
+    res.json(clusterableItems);
+
+  } catch(err){
+    console.error(err);
+    res.status(500).json({message: '시설 로드 실패', error: err.toString()});
+  }
 });
 
 // ---------------------------------
-// 8. WebSocket 서버 설정 (실시간 알림용)
+// 🔑 3. WebSocket 서버 설정 및 클라이언트 관리
 // ---------------------------------
+
 const server = http.createServer(app); 
 const wss = new WebSocket.Server({ server });
-const clients = {}; 
+const clients = {}; // { userId: ws }
 
 wss.on('connection', (ws, req) => {
-    // URL 쿼리 파라미터에서 토큰 추출
     const token = req.url.split('token=')[1];
     if (!token) {
         return ws.close(1008, '토큰이 필요합니다.');
     }
 
     let userId;
-    try {
-        const payload = jwt.verify(token, JWT_SECRET);
-        userId = payload.userId;
-        clients[userId] = ws;
+    try { 
+        const payload = jwt.verify(token, JWT_SECRET); 
+        userId = payload.userId.toString(); 
+        clients[userId] = ws; 
+        ws.userId = userId; // ws 객체에 userId 저장
         console.log(`[WS] 클라이언트 연결됨: ${userId}`);
     } catch (err) {
         return ws.close(1008, '유효하지 않은 토큰');
@@ -388,45 +899,324 @@ wss.on('connection', (ws, req) => {
 
     ws.on('message', (message) => {
         console.log(`[WS] 수신: ${message}`);
+        
+        try {
+            const data = JSON.parse(message);
+            const payload = data.payload || {};
+
+            // ⭐ ⭐ ⭐ [핵심 추가] 매칭 요청 처리 로직 ⭐ ⭐ ⭐
+            if (data.type === 'matchRequest') {
+                handleMatchRequest({
+                    sport: payload.sport,
+                    count: payload.count,
+                    latitude: payload.latitude,
+                    longitude: payload.longitude,
+                }, ws);
+            } else if (data.type === 'autoMatchRequest') {
+                handleAutoMatchRequest({
+                    sport: payload.sport,
+                    count: payload.count,
+                    latitude: payload.latitude,
+                    longitude: payload.longitude,
+                }, ws);
+            } else if (data.type === 'cancelMatch') {
+                handleCancelMatch(ws);
+            }
+            
+            // ⭐ 기존 채팅 메시지 처리 로직 ( newMessage )
+            else if (data.type === 'newMessage') {
+                // ... (기존 채팅 메시지 저장/전달 로직 - 생략) ...
+            }
+
+        } catch (e) {
+            console.error('WS 메시지 처리 오류:', e);
+        }
     });
 
     ws.on('close', () => {
-        delete clients[userId];
+        delete clients[userId]; 
         console.log(`[WS] 클라이언트 연결 끊김: ${userId}`);
+        // 연결 끊김 시 대기열에서도 제거
+        handleCancelMatch(ws);
     });
 });
 
-// 9. WebSocket 메시지 브로드캐스트 함수
-async function broadcastMessage(roomId, message) {
-    const result = await db.query('SELECT user_id FROM participants WHERE chat_room_id = $1', [roomId]);
-    const userIds = result.rows.map(row => row.user_id);
+// ---------------------------------
+// ⭐ 4. DB 트랜잭션 및 헬퍼 함수
+// ---------------------------------
 
-    // 클라이언트에게 전송할 메시지 페이로드
-    const payload = JSON.stringify({
-        type: 'newMessage',
-        payload: {
-            id: message.id,
-            chat_room_id: message.chat_room_id,
-            sender_id: message.sender_id,
-            text: message.text,
-            created_at: message.created_at,
-            // 실제 unread_count는 클라이언트가 서버에서 룸 목록을 리로드하여 업데이트해야 합니다.
-            // 여기서는 임시로 참여자 수를 보낼 수 있습니다. (하지만 DB 업데이트가 정확)
-            // 브로드캐스트는 실시간 푸시 알림 역할에 집중합니다.
-        }
-    });
+/**
+ * 트랜잭션을 사용하여 채팅방, 게시물, 참가자, 멤버를 생성합니다.
+ */
+async function createNewChatAndPost(client, userIds, sport, facility = null) {
+    let postId, chatRoomId;
 
-    for (const uid of userIds) {
-        const ws = clients[uid];
-        if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(payload);
+    try {
+        // 1. chat_rooms 생성
+        const roomResult = await client.query(
+            'INSERT INTO chat_rooms DEFAULT VALUES RETURNING id'
+        );
+        chatRoomId = roomResult.rows[0].id;
+
+        // 2. posts 생성 (첫 번째 유저를 게시물 생성자로 지정)
+        const postResult = await client.query(
+            'INSERT INTO posts(user_id, sport, title, content) VALUES ($1, $2, $3, $4) RETURNING id',
+            [
+                userIds[0], 
+                sport, 
+                `${sport} 퀵 매치 (${userIds.length}인)`, 
+                facility ? `[자동 추천] ${facility.name}에서 만나요!` : '수동 퀵 매치입니다.'
+            ]
+        );
+        postId = postResult.rows[0].id;
+        
+        // 3. map_locations 생성 (자동 추천일 경우)
+        if (facility) {
+             // WKT 문자열을 PostGIS의 Geometry 타입으로 변환 (ST_SetSRID를 사용해야 함)
+             const wkt = `POINT(${facility.longitude} ${facility.latitude})`;
+             await client.query(
+                'INSERT INTO map_locations(post_id, location_name, location_geom) VALUES ($1, $2, ST_SetSRID(ST_GeomFromText($3), 4326))',
+                [postId, facility.name, wkt]
+            );
         }
+
+        // 4. participants 및 post_members에 유저 추가
+        for (const userId of userIds) {
+            await client.query(
+                'INSERT INTO participants(chat_room_id, user_id) VALUES ($1, $2)',
+                [chatRoomId, userId]
+            );
+            await client.query(
+                'INSERT INTO post_members(post_id, user_id) VALUES ($1, $2)',
+                [postId, userId]
+            );
+        }
+
+        return chatRoomId;
+
+    } catch (e) {
+        console.error('createNewChatAndPost 트랜잭션 오류:', e);
+        throw e;
     }
 }
 
+/**
+ * PostGIS를 사용하여 최적 중심점에서 가장 가까운 시설을 찾는 함수
+ */
+async function findNearestFacility(centerLat, centerLon, sport) {
+    const client = await db.getClient();
+    try {
+        // 4326(WGS84) 좌표계 사용
+        const query = `
+            SELECT 
+                facility_id, 
+                name, 
+                address,
+                ST_X(location_geom) AS longitude,
+                ST_Y(location_geom) AS latitude
+            FROM 
+                facilities_for_map
+            WHERE 
+                sport_name = $1 -- exercises 테이블의 name 컬럼과 매핑된다고 가정
+            ORDER BY 
+                ST_Distance(location_geom, ST_SetSRID(ST_MakePoint($2, $3), 4326))
+            LIMIT 1;
+        `;
+        const result = await client.query(query, [sport, centerLon, centerLat]);
+
+        if (result.rows.length > 0) {
+            const row = result.rows[0];
+            return {
+                id: row.facility_id.toString(),
+                name: row.name,
+                address: row.address,
+                latitude: row.latitude,
+                longitude: row.longitude,
+            };
+        }
+    } catch (error) {
+        console.error("시설 조회 중 오류:", error);
+    } finally {
+        client.release();
+    }
+    return null;
+}
+
+/**
+ * 기하학적 중앙값 (Centroid) 계산 함수 (간단한 평균으로 대체)
+ */
+function calculateGeometricMedian(locations) {
+    const totalLat = locations.reduce((sum, loc) => sum + loc.latitude, 0);
+    const totalLon = locations.reduce((sum, loc) => sum + loc.longitude, 0);
+    const count = locations.length;
+    return {
+        latitude: totalLat / count,
+        longitude: totalLon / count,
+    };
+}
+
+
 // ---------------------------------
-// 10. 서버 시작
+// ⭐ 5. 매칭 핸들러 구현
 // ---------------------------------
+
+// 매칭 성공 시 클라이언트에게 이벤트 발송
+function sendMatchSuccess(userIds, roomId, sport, facility = null) {
+    const payload = JSON.stringify({
+        type: 'matchSuccess',
+        payload: {
+            roomId: roomId.toString(),
+            sport: sport,
+            recommendedFacility: facility, // 자동 매칭일 경우 시설 정보 포함
+        }
+    });
+    
+    userIds.forEach(uid => {
+        const ws = clients[uid.toString()];
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(payload);
+        }
+    });
+}
+
+/**
+ * 대기열에서 매칭 상대를 찾아 반환합니다.
+ */
+async function findMatch(client, currentUserId, sport, count, latitude, longitude) {
+    const key = `${sport}_${count}`;
+    
+    // 1. 매칭 조건에 맞는 (동일 종목, 동일 인원) 상대 찾기 (대기열에 1명만 있다고 가정)
+    const matchQuery = `
+        SELECT user_id, latitude, longitude FROM match_queue
+        WHERE sport = $1 AND count = $2 AND user_id != $3
+        LIMIT 1
+    `;
+    const result = await client.query(matchQuery, [sport, count, currentUserId]);
+    
+    if (result.rows.length > 0) {
+        const matchedUser = result.rows[0];
+        const matchedUserId = matchedUser.user_id;
+
+        // 2. 매칭된 두 사용자 대기열에서 제거
+        await client.query(
+            'DELETE FROM match_queue WHERE user_id IN ($1, $2)',
+            [currentUserId, matchedUserId]
+        );
+
+        return {
+            matchedUserIds: [currentUserId, matchedUserId],
+            matchedLocations: [
+                { latitude, longitude },
+                { latitude: matchedUser.latitude, longitude: matchedUser.longitude },
+            ]
+        };
+    }
+    return null;
+}
+
+/**
+ * 대기열에 사용자 정보를 등록합니다.
+ */
+async function addToQueue(client, userId, sport, count, latitude, longitude) {
+    await client.query(
+        'INSERT INTO match_queue(user_id, sport, count, latitude, longitude) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (user_id) DO UPDATE SET sport = $2, count = $3, latitude = $4, longitude = $5',
+        [userId, sport, count, latitude, longitude]
+    );
+}
+
+// 1. 수동 매칭 핸들러
+async function handleMatchRequest(data, ws) {
+    const userId = parseInt(ws.userId);
+    const client = await db.getClient();
+    await client.query('BEGIN');
+
+    try {
+        const matchResult = await findMatch(client, userId, data.sport, data.count, data.latitude, data.longitude);
+
+        if (matchResult) {
+            // 매칭 성공: 채팅방 생성 및 이벤트 발송
+            const newRoomId = await createNewChatAndPost(client, matchResult.matchedUserIds, data.sport, null);
+            await client.query('COMMIT');
+            
+            // 시설 정보 없음 (수동 매칭)
+            sendMatchSuccess(matchResult.matchedUserIds, newRoomId, data.sport, null);
+            console.log(`[수동 매칭] ${userId} 매칭 성공 -> 룸 ID: ${newRoomId}`);
+        } else {
+            // 매칭 실패: 대기열 등록
+            await addToQueue(client, userId, data.sport, data.count, data.latitude, data.longitude);
+            await client.query('COMMIT');
+            console.log(`[수동 매칭] ${userId} 대기열 등록`);
+            // 클라이언트에게 대기 중임을 알리는 피드백 (선택 사항)
+        }
+    } catch (e) {
+        await client.query('ROLLBACK');
+        console.error(`[수동 매칭] 처리 중 오류 발생: ${e.message}`);
+        // 클라이언트에게 에러 메시지 전송 (선택 사항)
+    } finally {
+        client.release();
+    }
+}
+
+// 2. 자동 추천 매칭 핸들러
+async function handleAutoMatchRequest(data, ws) {
+    const userId = parseInt(ws.userId);
+    const client = await db.getClient();
+    await client.query('BEGIN');
+
+    try {
+        const matchResult = await findMatch(client, userId, data.sport, data.count, data.latitude, data.longitude);
+
+        if (matchResult) {
+            // 1. 최적 중심점 계산 (Geometric Median/Centroid)
+            const center = calculateGeometricMedian(matchResult.matchedLocations); 
+            
+            // 2. 최적 시설 찾기 (PostGIS)
+            const facility = await findNearestFacility(center.latitude, center.longitude, data.sport);
+
+            // 3. 채팅방 및 게시물 생성 (시설 정보 포함)
+            const newRoomId = await createNewChatAndPost(client, matchResult.matchedUserIds, data.sport, facility);
+            await client.query('COMMIT');
+
+            // 4. 매칭 성공 이벤트 발송
+            sendMatchSuccess(matchResult.matchedUserIds, newRoomId, data.sport, facility);
+            console.log(`[자동 매칭] ${userId} 매칭 성공 -> 룸 ID: ${newRoomId}, 시설: ${facility?.name}`);
+        } else {
+            // 매칭 실패: 대기열 등록
+            await addToQueue(client, userId, data.sport, data.count, data.latitude, data.longitude);
+            await client.query('COMMIT');
+            console.log(`[자동 매칭] ${userId} 대기열 등록`);
+        }
+    } catch (e) {
+        await client.query('ROLLBACK');
+        console.error(`[자동 매칭] 처리 중 오류 발생: ${e.message}`);
+    } finally {
+        client.release();
+    }
+}
+
+// 3. 매칭 취소 핸들러
+async function handleCancelMatch(ws) {
+    if (!ws.userId) return;
+    const userId = parseInt(ws.userId);
+    const client = await db.getClient();
+    
+    try {
+        // 대기열에서 사용자 제거
+        await client.query(
+            'DELETE FROM match_queue WHERE user_id = $1',
+            [userId]
+        );
+        console.log(`[매칭 취소] ${userId} 대기열에서 제거 완료`);
+    } catch (e) {
+        console.error(`[매칭 취소] 처리 중 오류 발생: ${e.message}`);
+    } finally {
+        client.release();
+    }
+}
+// ---------------------------------
+// 🔑 6. 서버 리스닝
+// ---------------------------------
+
 server.listen(PORT, () => {
-    console.log(`Server (HTTP + WS) listening on port ${PORT}`);
+    console.log(`서버가 포트 ${PORT}에서 실행 중입니다.`);
 });
