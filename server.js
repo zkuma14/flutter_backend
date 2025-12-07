@@ -1132,8 +1132,8 @@ wss.on('connection', (ws, req) => {
 
       switch(data.type){
         case 'join_match':
-          // ⭐️ payload에 isAutoMatch가 포함됨
-          await handleJoinMatch(userId, data.payload); 
+          // ⭐️ isAutoMatch 파라미터 추가 수신
+          await handleJoinMatch(userId, data.payload);
           break;
         case 'cancel_match':
           console.log(`유저(${userId}) 매칭 취소 요청`)
@@ -1172,7 +1172,7 @@ wss.on('close', function close() {
 });
 
 // ---------------------------------
-// ⭐️ 9. WebSocket 브로드캐스트 (이전 로직 유지)
+// ⭐️ 9. WebSocket 브로드캐스트
 // ---------------------------------
 async function broadcastMessage(roomId, message) {
   console.log(`📡 [WS] 브로드캐스트 시작 (방: ${roomId})`);
@@ -1249,9 +1249,9 @@ async function broadcastMessage(roomId, message) {
 // ⚡️ 매칭 로직 (강화된 버전: 자동/수동 분리 + 시설 추천)
 // ---------------------------------
 
-// 1. 대기열 등록 (강화)
+// 1. 대기열 등록
 async function handleJoinMatch(userId, payload) {
-  // ⭐️ isAutoMatch 수신 (클라이언트에서 보낸 값)
+  // ⭐️ isAutoMatch 수신 (Flutter에서 보낸 값)
   const { sport, lat, lng, target_count, isAutoMatch } = payload;
   
   // undefined 방지 (기본값 false)
@@ -1282,12 +1282,12 @@ async function handleJoinMatch(userId, payload) {
     client.release();
   }
   
-  // ⭐️ 매칭 시도 함수 호출 (타입 전달)
+  // 매칭 시도 함수 호출 (타입 전달)
   await tryMatchMaking(sport, target_count, isAuto);
 }
 
-// 2. 매칭 프로세스 실행 (강화)
-async function tryMatchMaking(sport, targetCount, isAuto) { // ⭐️ isAuto 인자 추가
+// 2. 매칭 프로세스 실행
+async function tryMatchMaking(sport, targetCount, isAuto) {
   const client = await db.getClient();
   try {
     // 2-1. 조건에 맞는 대기자 검색
@@ -1308,15 +1308,15 @@ async function tryMatchMaking(sport, targetCount, isAuto) { // ⭐️ isAuto 인
     // 2-2. 인원이 꽉 찼으면 매칭 성사!
     if (members.length === parseInt(targetCount)) {
       const memberIds = members.map(m => m.user_id);
-      console.log(`[MATCH] 성사! (Auto: ${isAuto}) 멤버: ${memberIds}`); // ⭐️ 로그에 isAuto 추가
+      console.log(`[MATCH] 성사! (Auto: ${isAuto}) 멤버: ${memberIds}`);
       
       await client.query('BEGIN');
 
       // -------------------------------------------------
-      // ⭐️ [Auto Match 로직] 중간 지점 시설 찾기 및 방 이름 설정
+      // ⭐️ [Auto Match 로직] 중간 지점 시설 찾기
       // -------------------------------------------------
       let recommendedFacility = null;
-      let roomName = `⚡ ${sport} 퀵 매치`; // ⭐️ 기본 방 이름
+      let roomName = `⚡ ${sport} 퀵 매치`; // 기본 방 이름
 
       if (isAuto) {
         // 1. 멤버들의 중간 지점(Centroid) 계산 및 가장 가까운 시설 조회
@@ -1339,23 +1339,20 @@ async function tryMatchMaking(sport, targetCount, isAuto) { // ⭐️ isAuto 인
         
         if (facilityRes.rows.length > 0) {
           recommendedFacility = facilityRes.rows[0];
+          console.log(`📍 추천 시설 발견: ${recommendedFacility['시설명']}`);
           
-          // ⭐️ 시설명으로 방 이름 설정
-          roomName = `⚡ ${sport} @${recommendedFacility['시설명']}`; 
-          console.log(`📍 추천 시설 발견 및 방 이름 설정: ${roomName}`);
-        } else {
-          console.log('📍 조건에 맞는 시설을 찾지 못함 (근처에 없음)');
+          // (선택) 방 이름에 시설명 포함
+          // roomName = `⚡ ${sport} @${recommendedFacility['시설명']}`;
         }
       }
       // -------------------------------------------------
-
 
       // A. 채팅방 생성
       const roomRes = await client.query(
         `INSERT INTO chat_rooms (room_name, last_message, last_message_timestamp) 
          VALUES ($1, $2, NOW()) RETURNING id`,
         [
-          roomName, // ⭐️ 결정된 roomName 사용
+          roomName, 
           isAuto && recommendedFacility 
             ? `매칭 성공! 추천 장소: ${recommendedFacility['시설명']}` 
             : '매칭이 성사되었습니다!'
@@ -1380,14 +1377,13 @@ async function tryMatchMaking(sport, targetCount, isAuto) { // ⭐️ isAuto 인
       await client.query('COMMIT');
 
       // D. 알림 전송 (WebSocket)
-      // ⭐️ 클라이언트(Dart)가 받을 payload에 recommendedFacility 및 roomName 추가
+      // ⭐️ 클라이언트(Dart)가 받을 payload에 recommendedFacility 추가
       const notifyPayload = JSON.stringify({
         type: 'match_success',
         payload: { 
           roomId: roomId, 
           sport: sport,
-          recommendedFacility: recommendedFacility, 
-          roomName: roomName // ⭐️ 최종 방 제목 전송
+          recommendedFacility: recommendedFacility // (자동 매칭 아니면 null)
         }
       });
 
@@ -1406,7 +1402,7 @@ async function tryMatchMaking(sport, targetCount, isAuto) { // ⭐️ isAuto 인
   }
 }
 
-// 3. 매칭 취소 (이전 로직 유지)
+// 3. 매칭 취소
 async function handleCancelMatch(userId) {
   try {
     await db.query('DELETE FROM match_queue WHERE user_id = $1', [userId]);
@@ -1417,8 +1413,8 @@ async function handleCancelMatch(userId) {
 }
 
 // ---------------------------------
-// 10. 서버 시작 (이전 로직 유지)
+// 10. 서버 시작
 // ---------------------------------
-// server.listen(PORT, () => {
-//   console.log(`Server (HTTP + WS) listening on port ${PORT}`);
-// });
+server.listen(PORT, () => {
+  console.log(`Server (HTTP + WS) listening on port ${PORT}`);
+});
