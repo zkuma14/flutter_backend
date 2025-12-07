@@ -1417,8 +1417,8 @@ async function handleCancelMatch(userId) {
 }
 
 // ---------------------------------
-// 10. 서버 시작 (이전 로직 유지)
+// 10. 서버 시작
 // ---------------------------------
-// server.listen(PORT, () => {
-//   console.log(`Server (HTTP + WS) listening on port ${PORT}`);
-// });
+server.listen(PORT, () => {
+  console.log(`Server (HTTP + WS) listening on port ${PORT}`);
+});
