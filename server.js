@@ -1096,7 +1096,7 @@ app.get('/sports/categories', authenticateToken, async(req,res)=>{
 });
 
 // ---------------------------------
-// ⚡️ 8. WebSocket 서버 설정 (⭐️ Heartbeat 추가)
+// ⚡️ 8. WebSocket 서버 설정 (⭐️ Heartbeat + 매칭 로직 강화)
 // ---------------------------------
 const server = http.createServer(app); 
 const wss = new WebSocket.Server({ server });
@@ -1125,17 +1125,18 @@ wss.on('connection', (ws, req) => {
       return ws.close(1008, '유효하지 않은 토큰');
     }
 
-  //실시간 매칭 용
+  // 실시간 매칭 및 메시지 처리
   ws.on('message', async(message)=>{
     try{
       const data = JSON.parse(message);
 
       switch(data.type){
         case 'join_match':
+          // ⭐️ isAutoMatch 파라미터 추가 수신
           await handleJoinMatch(userId, data.payload);
           break;
         case 'cancel_match':
-          console.log(`유저({$userId}) 매칭 취소 요청`)
+          console.log(`유저(${userId}) 매칭 취소 요청`)
           await handleCancelMatch(userId);
           break;
       }
@@ -1144,9 +1145,7 @@ wss.on('connection', (ws, req) => {
     }
   });
 
-  //
-
- ws.on('close', async () => {
+  ws.on('close', async () => {
     if (userId) {
       if (clients[userId] === ws) {
         delete clients[userId];
@@ -1173,7 +1172,7 @@ wss.on('close', function close() {
 });
 
 // ---------------------------------
-// ⭐️ 9. [수정] WebSocket 브로드캐스트 (단순화 & 디버깅 강화 버전)
+// ⭐️ 9. WebSocket 브로드캐스트
 // ---------------------------------
 async function broadcastMessage(roomId, message) {
   console.log(`📡 [WS] 브로드캐스트 시작 (방: ${roomId})`);
@@ -1216,19 +1215,18 @@ async function broadcastMessage(roomId, message) {
             sender_id: message.sender_id,
             text: message.text,
             created_at: message.created_at,
-            unread_count: message.unread_count, // (참고: 정확한 계산은 별도 로직 필요하나 일단 전송)
+            unread_count: message.unread_count, 
             chat_name: senderName, // ⭐️ 익명 이름 전송
           }
         });
         ws.send(messagePayload);
 
         // B. 채팅방 목록 갱신 신호 (roomUpdate)
-        // (상대방의 방 이름은 내 이름이거나 그룹명이어야 하는데, 일단 DB의 room_name이나 시스템 로직 따름)
         const updatePayload = JSON.stringify({
           type: 'roomUpdate',
           payload: {
             id: roomId,
-            room_name: roomInfo.room_name || senderName, // 방 이름이 없으면 보낸 사람 이름 표시
+            room_name: roomInfo.room_name || senderName,
             last_message: roomInfo.last_message,
             last_message_timestamp: roomInfo.last_message_timestamp,
             my_unread_count: p.unread_count,
@@ -1247,23 +1245,35 @@ async function broadcastMessage(roomId, message) {
   }
 }
 
-//실시간 매칭 로직
+// ---------------------------------
+// ⚡️ 매칭 로직 (강화된 버전: 자동/수동 분리 + 시설 추천)
+// ---------------------------------
+
+// 1. 대기열 등록
 async function handleJoinMatch(userId, payload) {
-  const {sport,lat,lng,target_count} = payload;
-  console.log(`[MATCH] 유저(${userId}) 대기열 등록: ${sport}, ${target_count}명`);
+  // ⭐️ isAutoMatch 수신 (Flutter에서 보낸 값)
+  const { sport, lat, lng, target_count, isAutoMatch } = payload;
+  
+  // undefined 방지 (기본값 false)
+  const isAuto = isAutoMatch === true;
+
+  console.log(`[MATCH] 유저(${userId}) 대기열 등록: ${sport}, ${target_count}명, 자동매칭: ${isAuto}`);
 
   const client = await db.getClient();
   try{
     await client.query('BEGIN');
+    
+    // 기존 대기열 제거 (재시도 시 중복 방지)
     await client.query('DELETE FROM match_queue WHERE user_id = $1', [userId]);
+    
+    // ⭐️ is_auto 컬럼 추가 저장
     await client.query(
-      `INSERT INTO match_queue (user_id, socket_id, sport, target_count, geom)
-      VALUES ($1, $2, $3, $4, ST_SetSRID(ST_MakePoint($5, $6), 4326))`,
-      [userId, 'socket_placeholder', sport, target_count, lng, lat]
+      `INSERT INTO match_queue (user_id, socket_id, sport, target_count, geom, is_auto)
+       VALUES ($1, $2, $3, $4, ST_SetSRID(ST_MakePoint($5, $6), 4326), $7)`,
+      [userId, 'socket_placeholder', sport, target_count, lng, lat, isAuto]
     );
 
     await client.query('COMMIT');
-    //await tryMatchMaking(client, sport, target_count);
   }catch(err){
     await client.query('ROLLBACK');
     console.error('[MATCH] 등록 실패:',err);
@@ -1271,38 +1281,82 @@ async function handleJoinMatch(userId, payload) {
   }finally{
     client.release();
   }
-  await tryMatchMaking(sport, target_count);
+  
+  // 매칭 시도 함수 호출 (타입 전달)
+  await tryMatchMaking(sport, target_count, isAuto);
 }
 
-async function tryMatchMaking(sport, targetCount) {
-  const client  = await db.getClient();
+// 2. 매칭 프로세스 실행
+async function tryMatchMaking(sport, targetCount, isAuto) {
+  const client = await db.getClient();
   try {
-    // 2-1. 조건에 맞는 대기자 검색 (같은 종목, 같은 인원수)
-    // (거리 제한 3km 추가: ST_DWithin)
+    // 2-1. 조건에 맞는 대기자 검색
+    // ⭐️ sport, target_count가 같고, '매칭 타입(is_auto)'도 같은 사람끼리만 매칭
     const query = `
       SELECT user_id, ST_AsText(geom) as location
       FROM match_queue 
       WHERE sport = $1 
         AND target_count = $2
-        AND is_active = TRUE
+        AND is_auto = $3
       ORDER BY created_at ASC
       LIMIT $2
     `;
     
-    const result = await client.query(query, [sport, targetCount]);
+    const result = await client.query(query, [sport, targetCount, isAuto]);
     const members = result.rows;
 
     // 2-2. 인원이 꽉 찼으면 매칭 성사!
     if (members.length === parseInt(targetCount)) {
-      console.log(`[MATCH] 성사! 멤버: ${members.map(m=>m.user_id)}`);
+      const memberIds = members.map(m => m.user_id);
+      console.log(`[MATCH] 성사! (Auto: ${isAuto}) 멤버: ${memberIds}`);
       
       await client.query('BEGIN');
+
+      // -------------------------------------------------
+      // ⭐️ [Auto Match 로직] 중간 지점 시설 찾기
+      // -------------------------------------------------
+      let recommendedFacility = null;
+      let roomName = `⚡ ${sport} 퀵 매치`; // 기본 방 이름
+
+      if (isAuto) {
+        // 1. 멤버들의 중간 지점(Centroid) 계산 및 가장 가까운 시설 조회
+        const facilityQuery = `
+          WITH MemberCentroid AS (
+             SELECT ST_Centroid(ST_Collect(geom)) AS center_geom
+             FROM match_queue
+             WHERE user_id = ANY($1::int[])
+          )
+          SELECT 
+            "시설명", "주소", "도로명우편번호", "시설위도", "시설경도",
+            ST_Distance(geom::geography, (SELECT center_geom FROM MemberCentroid)::geography) as dist_meters
+          FROM facilities_for_map
+          WHERE ("firstSports" LIKE '%' || $2 || '%' OR "secondSports" LIKE '%' || $2 || '%')
+          ORDER BY geom <-> (SELECT center_geom FROM MemberCentroid)
+          LIMIT 1;
+        `;
+        
+        const facilityRes = await client.query(facilityQuery, [memberIds, sport]);
+        
+        if (facilityRes.rows.length > 0) {
+          recommendedFacility = facilityRes.rows[0];
+          console.log(`📍 추천 시설 발견: ${recommendedFacility['시설명']}`);
+          
+          // (선택) 방 이름에 시설명 포함
+          // roomName = `⚡ ${sport} @${recommendedFacility['시설명']}`;
+        }
+      }
+      // -------------------------------------------------
 
       // A. 채팅방 생성
       const roomRes = await client.query(
         `INSERT INTO chat_rooms (room_name, last_message, last_message_timestamp) 
          VALUES ($1, $2, NOW()) RETURNING id`,
-        [`⚡ ${sport} 퀵 매치`, '매칭이 성사되었습니다!']
+        [
+          roomName, 
+          isAuto && recommendedFacility 
+            ? `매칭 성공! 추천 장소: ${recommendedFacility['시설명']}` 
+            : '매칭이 성사되었습니다!'
+        ]
       );
       const roomId = roomRes.rows[0].id;
 
@@ -1315,18 +1369,22 @@ async function tryMatchMaking(sport, targetCount) {
       }
 
       // C. 대기열에서 삭제
-      const userIds = members.map(m => m.user_id);
       await client.query(
         `DELETE FROM match_queue WHERE user_id = ANY($1::int[])`,
-        [userIds]
+        [memberIds]
       );
 
       await client.query('COMMIT');
 
       // D. 알림 전송 (WebSocket)
+      // ⭐️ 클라이언트(Dart)가 받을 payload에 recommendedFacility 추가
       const notifyPayload = JSON.stringify({
         type: 'match_success',
-        payload: { roomId: roomId, sport: sport }
+        payload: { 
+          roomId: roomId, 
+          sport: sport,
+          recommendedFacility: recommendedFacility // (자동 매칭 아니면 null)
+        }
       });
 
       for (const member of members) {
