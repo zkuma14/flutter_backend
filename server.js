@@ -1380,21 +1380,39 @@ async function tryMatchMaking(sport, targetCount, isAuto) { // ⭐️ isAuto 인
       await client.query('COMMIT');
 
       // D. 알림 전송 (WebSocket)
-      // ⭐️ 클라이언트(Dart)가 받을 payload에 recommendedFacility 및 roomName 추가
       const notifyPayload = JSON.stringify({
         type: 'match_success',
         payload: { 
           roomId: roomId, 
           sport: sport,
           recommendedFacility: recommendedFacility, 
-          roomName: roomName // ⭐️ 최종 방 제목 전송
+          roomName: roomName // 최종 방 제목 전송
         }
       });
+
+      // ⭐️ 2. 채팅방 목록 갱신 알림 (roomUpdate) 준비
+      // 새 방이므로 unread_count는 0으로 가정합니다.
+      const updatePayload = JSON.stringify({
+          type: 'roomUpdate',
+          payload: {
+              id: roomId,
+              room_name: roomName, // ⭐️ 새로 생성된 방 이름 (시설명 포함)
+              last_message: isAuto && recommendedFacility ? `매칭 성공! 추천 장소: ${recommendedFacility['시설명']}` : '매칭이 성사되었습니다!', 
+              last_message_timestamp: new Date().toISOString(), // DB에 저장된 생성 시간
+              my_unread_count: 0, // 새 방이므로 0
+              left_at: null,
+          }
+      });
+
 
       for (const member of members) {
         const targetWs = clients[member.user_id];
         if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-          targetWs.send(notifyPayload);
+          // 1. match_success 전송 (채팅방 진입용)
+          targetWs.send(notifyPayload); 
+          
+          // ⭐️ 2. roomUpdate 전송 (메인 채팅방 목록 갱신용)
+          targetWs.send(updatePayload); 
         }
       }
     }
